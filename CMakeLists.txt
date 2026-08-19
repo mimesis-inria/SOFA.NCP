@@ -1,12 +1,16 @@
 cmake_minimum_required(VERSION 3.12)
-project(SOFA.NCP VERSION 0.1.0 LANGUAGES CXX)
+project(SofaNCP VERSION 0.1.0 LANGUAGES CXX)
 
-find_package(Sofa.Framework REQUIRED)
+if(NOT TARGET Sofa.Framework)
+    find_package(Sofa.Framework REQUIRED)
+endif()
+
 sofa_find_package(Sofa.Simulation.Core REQUIRED)
 sofa_find_package(Sofa.Component.LinearSystem REQUIRED)
 sofa_find_package(Sofa.Component.ODESolver.Backward REQUIRED)
 sofa_find_package(Sofa.Component.Constraint.Projective REQUIRED)
 sofa_find_package(Sofa.Component.SolidMechanics.FEM.Elastic REQUIRED)
+sofa_find_package(EnclosedCollisionPlugin REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
 
 set(SOFANCP_SRC_DIR src/sofa/ncp)
@@ -52,7 +56,7 @@ set(SOURCE_FILES
 )
 
 add_library(${PROJECT_NAME} SHARED ${HEADER_FILES_TO_MOC} ${MOCCED_HEADER_FILES} ${HEADER_FILES} ${SOURCE_FILES} ${README_FILES})
-target_link_libraries(${PROJECT_NAME} PUBLIC Sofa.Framework Sofa.Simulation.Core Sofa.Component.LinearSystem Sofa.Component.ODESolver.Backward Sofa.Component.Constraint.Projective Sofa.Component.SolidMechanics.FEM.Elastic Eigen3::Eigen)
+target_link_libraries(${PROJECT_NAME} PUBLIC Sofa.Framework Sofa.Simulation.Core Sofa.Component.LinearSystem Sofa.Component.ODESolver.Backward Sofa.Component.Constraint.Projective Sofa.Component.SolidMechanics.FEM.Elastic Eigen3::Eigen EnclosedCollisionPlugin)
 
 sofa_create_package_with_targets(
     PACKAGE_NAME ${PROJECT_NAME}

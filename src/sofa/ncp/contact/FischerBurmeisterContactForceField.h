@@ -5,19 +5,20 @@
 *     R_x      += H^T lambda
 *     R_lambda += phi(g, r lambda)
 *
-* With r frozen during a nonlinear solve:
+* Contact Jacobian with r frozen:
 *
 *         [ lambda Hess(g)    H^T ]
 *     J = [                       ]
 *         [      a H          b   ]
 *
-* Compliance modes:
-*   0 Fixed   : use fixedComplianceScale.
-*   1 Lagged  : use per-contact r = H C_ref H^T, frozen for the whole nonlinear solve.
-*               C_ref is built once from a symmetric positive reference beam metric
-*               K_ref = sum(T0 K0 T0^T), after eliminating fixed DOFs.
-*   2 Current : reserved for same-linearization scaling. Not enabled yet because
-*               changing r inside a Newton pass requires a matching residual policy.
+* Lagged scaling uses a positive reference beam metric:
+*
+*     C_ref = K_ref^{-1}
+*     W_ref = H C_ref H^T
+*     r_i   = (W_ref)_ii
+*
+* lambda remains scalar per frictionless normal constraint. W_ref is retained
+* in contact space for diagnostics and future Schur/preconditioning work.
 ****************************************************************************/
 #pragma once
 
@@ -125,6 +126,7 @@ public:
     Data<Real> d_fixedComplianceScale;
     Data<unsigned int> d_complianceMode;
     Data<Real> d_fbEpsilon;
+    Data<Real> d_contactNewtonRegularization;
 
     SingleLink<FischerBurmeisterContactForceField<DataTypes1, DataTypes2>, BeamForceField,
         BaseLink::FLAG_STOREPATH | BaseLink::FLAG_STRONGLINK> l_beamForceField;
@@ -150,6 +152,10 @@ public:
     Data<sofa::Size> d_activeContactCount;
     Data<sofa::Size> d_pinnedContactCount;
     Data<sofa::Size> d_invalidContactCount;
+    // Active-contact W_ref = H K_ref^{-1} H^T, flattened row-major.
+    Data<sofa::type::vector<Real>> d_referenceDelassus;
+    Data<sofa::type::vector<unsigned int>> d_referenceDelassusLambdaIndices;
+    Data<sofa::Size> d_referenceDelassusSize;
 
 protected:
     FischerBurmeisterContactForceField();
@@ -176,6 +182,11 @@ public:
     bool isCurrentEvaluationValid() const { return m_validState; }
     ResidualBlockNorms currentResidualBlockNorms() const;
     ContactDiagnostics currentContactDiagnostics() const;
+    bool getReferenceTranslationalComplianceBlock(sofa::Index pointI, sofa::Index pointJ, Mat3& block) const;
+
+    const sofa::type::vector<Real>& getReferenceDelassus() const { return m_referenceDelassus; }
+    const sofa::type::vector<sofa::Index>& getReferenceDelassusLambdaIndices() const { return m_referenceDelassusLambdaIndices; }
+    sofa::Size getReferenceDelassusSize() const { return m_referenceDelassusLambdaIndices.size(); }
 
     bool usesLaggedCompliance() const;
     bool usesCurrentCompliance() const;
@@ -214,8 +225,14 @@ protected:
     sofa::type::vector<Real> m_nextCompliance;
     bool m_hasNextCompliance = false;
 
-    // Constant diagonal translational blocks of K_ref^{-1}, one 3x3 block per beam node.
-    sofa::type::vector<Mat3> m_referencePointCompliance;
+    // Translational 3x3 blocks Ctt_ij of C_ref = K_ref^{-1}, row-major.
+    sofa::type::vector<Mat3> m_referenceTranslationalComplianceBlocks;
+    sofa::Size m_referenceCompliancePointCount = 0;
+
+    // Active-contact W_ref, row-major, plus lambda-index mapping.
+    sofa::type::vector<Real> m_referenceDelassus;
+    sofa::type::vector<sofa::Index> m_referenceDelassusLambdaIndices;
+
     sofa::Size m_cachedReferenceMetricVersion = std::numeric_limits<sofa::Size>::max();
     std::size_t m_cachedConstraintSignature = 0;
     bool m_referenceComplianceCacheValid = false;
@@ -237,7 +254,10 @@ protected:
     bool ensureReferenceComplianceCache();
     bool rebuildReferenceComplianceCache();
     std::size_t fixedConstraintSignature() const;
-    bool computeLaggedComplianceFromCurrentContacts(sofa::type::vector<Real>& candidate) const;
+    bool computeLaggedComplianceFromCurrentContacts(sofa::type::vector<Real>& candidate);
+
+    void clearReferenceDelassus();
+    void publishReferenceDelassus();
 
     ContactDiagnostics summarizeContacts() const;
     void publishDebugData();

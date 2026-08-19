@@ -40,16 +40,43 @@ NCPStaticSolver::NCPStaticSolver()
     , d_debug(initData(&d_debug, false, "debug", "Print residual-evaluation summaries."))
     , d_finiteDifferenceCheck(initData(&d_finiteDifferenceCheck, false,
         "finiteDifferenceCheck", "Compare actual line-search residual derivatives against J*d and contact derivatives."))
+    , d_adaptiveContactRegularization(initData(&d_adaptiveContactRegularization, false,
+        "adaptiveContactRegularization",
+        "Adaptively increase the tangent-only active-contact diagonal when the current contact Schur block is near singular."))
+    , d_contactSchurSingularValueFloor(initData(&d_contactSchurSingularValueFloor, 1e-3_sreal,
+        "contactSchurSingularValueFloor",
+        "Minimum requested singular value of the active contact Schur block before Newton solve."))
+    , d_contactSchurTargetConditionNumber(initData(&d_contactSchurTargetConditionNumber, 1e4_sreal,
+        "contactSchurTargetConditionNumber",
+        "Maximum requested active-contact Schur condition number; <=1 disables this criterion."))
+    , d_contactSchurMaxAdditionalRegularization(initData(&d_contactSchurMaxAdditionalRegularization, 1_sreal,
+        "contactSchurMaxAdditionalRegularization",
+        "Maximum additional tangent-only contact diagonal added adaptively in one Newton assembly."))
+    , d_logAdaptiveContactRegularization(initData(&d_logAdaptiveContactRegularization, false,
+        "logAdaptiveContactRegularization",
+        "Print contact Schur spectrum and adaptive regularization decisions."))
     , d_lastMechanicalResidualNorm(initData(&d_lastMechanicalResidualNorm, 0_sreal,
         "lastMechanicalResidualNorm", "Mechanical residual norm from the retained state."))
     , d_lastComplementarityResidualNorm(initData(&d_lastComplementarityResidualNorm, 0_sreal,
         "lastComplementarityResidualNorm", "Complementarity residual norm from the retained state."))
     , d_lastComplianceCaptureSucceeded(initData(&d_lastComplianceCaptureSucceeded, false,
         "lastComplianceCaptureSucceeded", "Whether compliance was captured after the last converged solve."))
+    , d_lastContactSchurSigmaMinBefore(initData(&d_lastContactSchurSigmaMinBefore, 0_sreal,
+        "lastContactSchurSigmaMinBefore", "Smallest active-contact Schur singular value before adaptive damping."))
+    , d_lastContactSchurSigmaMinAfter(initData(&d_lastContactSchurSigmaMinAfter, 0_sreal,
+        "lastContactSchurSigmaMinAfter", "Smallest active-contact Schur singular value after adaptive damping."))
+    , d_lastContactSchurConditionBefore(initData(&d_lastContactSchurConditionBefore, 0_sreal,
+        "lastContactSchurConditionBefore", "Active-contact Schur condition estimate before adaptive damping."))
+    , d_lastAdaptiveContactRegularization(initData(&d_lastAdaptiveContactRegularization, 0_sreal,
+        "lastAdaptiveContactRegularization", "Additional contact diagonal applied to the last assembled Newton matrix."))
 {
     d_lastMechanicalResidualNorm.setReadOnly(true);
     d_lastComplementarityResidualNorm.setReadOnly(true);
     d_lastComplianceCaptureSucceeded.setReadOnly(true);
+    d_lastContactSchurSigmaMinBefore.setReadOnly(true);
+    d_lastContactSchurSigmaMinAfter.setReadOnly(true);
+    d_lastContactSchurConditionBefore.setReadOnly(true);
+    d_lastAdaptiveContactRegularization.setReadOnly(true);
 }
 
 void NCPStaticSolver::init()
@@ -79,6 +106,19 @@ void NCPStaticSolver::init()
         return;
     }
 
+    if (!(d_contactSchurSingularValueFloor.getValue() > 0_sreal)
+        || !(d_contactSchurMaxAdditionalRegularization.getValue() >= 0_sreal)
+        || !std::isfinite(static_cast<double>(d_contactSchurSingularValueFloor.getValue()))
+        || !std::isfinite(static_cast<double>(d_contactSchurTargetConditionNumber.getValue()))
+        || !std::isfinite(static_cast<double>(d_contactSchurMaxAdditionalRegularization.getValue())))
+    {
+        msg_error() << "Adaptive contact regularization parameters must be finite; "
+                    << "contactSchurSingularValueFloor must be positive and "
+                    << "contactSchurMaxAdditionalRegularization must be nonnegative.";
+        d_componentState.setValue(core::objectmodel::ComponentState::Invalid);
+        return;
+    }
+
     d_componentState.setValue(core::objectmodel::ComponentState::Valid);
 }
 
@@ -97,7 +137,7 @@ public:
     using ContactForceField = NCPStaticSolver::ContactForceField;
 
     NCPStaticResidualFunction(
-        const NCPStaticSolver& owner,
+        NCPStaticSolver& owner,
         MechanicalOperations& mechanicalOperations,
         core::behavior::MultiVecCoord& position,
         core::behavior::MultiVecDeriv& residual,
@@ -232,8 +272,8 @@ public:
     //     const Eigen::Index lambdaDofs = static_cast<Eigen::Index>(lambdaDofCount());
     //     const Eigen::Index lambdaBegin = cols - lambdaDofs;
 
-    //     const SReal muMechanical = 1e-10_sreal;
-    //     const SReal muLambda = 3e-5_sreal;
+    //     const SReal muMechanical = 0.0;
+    //     const SReal muLambda = 1e-4;
 
     //     for (Eigen::Index col = 0; col < cols; ++col)
     //     {
@@ -248,6 +288,66 @@ public:
 
     //     system->dispatchSystemSolution(m_correction);
     // }
+
+    /**
+     * Multiplier-only LM fallback. This does not alter the residual or the stored
+     * Jacobian. It solves an augmented least-squares system only when requested
+     * by the outer Newton globalization.
+     */
+    bool solveLevenbergMarquardt(SReal muLambda) override
+    {
+        SCOPED_TIMER("NCPLMSolve");
+
+        if (!(muLambda > 0_sreal) || !std::isfinite(static_cast<double>(muLambda)))
+            return false;
+
+        auto* system = m_linearSolver ? m_linearSolver->getLinearSystem() : nullptr;
+        if (!system)
+            return false;
+
+        system->setSystemSolution(m_correction);
+        system->setRHS(m_residual);
+
+        auto* matrix = system->getSystemBaseMatrix();
+        auto* rhs = system->getSystemRHSBaseVector();
+        auto* solution = system->getSystemSolutionBaseVector();
+
+        if (!matrix || !rhs || !solution)
+            return false;
+
+        const Eigen::Index rows = matrix->rowSize();
+        const Eigen::Index cols = matrix->colSize();
+        const Eigen::Index lambdaDofs = static_cast<Eigen::Index>(lambdaDofCount());
+        const Eigen::Index lambdaBegin = cols - lambdaDofs;
+
+        if (rows <= 0 || cols <= 0 || rows != cols || lambdaDofs <= 0 || lambdaBegin < 0)
+            return false;
+
+        Eigen::MatrixXd augmented = Eigen::MatrixXd::Zero(rows + lambdaDofs, cols);
+        Eigen::VectorXd augmentedRhs = Eigen::VectorXd::Zero(rows + lambdaDofs);
+
+        for (Eigen::Index row = 0; row < rows; ++row)
+        {
+            augmentedRhs[row] = static_cast<double>(rhs->element(row));
+
+            for (Eigen::Index col = 0; col < cols; ++col)
+                augmented(row, col) = static_cast<double>(matrix->element(row, col));
+        }
+
+        const double sqrtMu = std::sqrt(static_cast<double>(muLambda));
+        for (Eigen::Index local = 0; local < lambdaDofs; ++local)
+            augmented(rows + local, lambdaBegin + local) = sqrtMu;
+
+        const Eigen::VectorXd correction = augmented.colPivHouseholderQr().solve(augmentedRhs);
+        if (!correction.allFinite())
+            return false;
+
+        for (Eigen::Index i = 0; i < cols; ++i)
+            solution->set(i, static_cast<SReal>(correction[i]));
+
+        system->dispatchSystemSolution(m_correction);
+        return correctionIsFinite();
+    }
 
     /** Compatibility path; the merit solver reconstructs trials from m_newtonState. */
     void updateGuessFromLinearSolution(SReal alpha) override
@@ -456,10 +556,17 @@ public:
         }
 
         const SReal denom = std::max(std::sqrt(rhs2), std::numeric_limits<SReal>::epsilon());
-        msg_info(&m_owner) << "[NCP FD BASE] rows=" << rows
-                           << " mechanicalRows=" << m_fdMechanicalDofs
-                           << " lambdaRows=" << lambdaDofs
-                           << " linearRelErr=" << std::sqrt(linearDefect2) / denom;
+        const SReal linearRelErr = std::sqrt(linearDefect2) / denom;
+
+        // A*d=R should be solved to high accuracy. Stay silent for healthy solves.
+        if (linearRelErr > 1e-8_sreal)
+        {
+            msg_warning(&m_owner) << "[NCP FD LINEAR]"
+                                  << " rows=" << rows
+                                  << " M=" << m_fdMechanicalDofs
+                                  << " FB=" << lambdaDofs
+                                  << " relErr=" << linearRelErr;
+        }
 
         m_contact->storeFiniteDifferenceBase();
         m_fdReady = true;
@@ -490,9 +597,39 @@ public:
         SReal complementarityFD2 = 0_sreal;
         SReal complementarityPredicted2 = 0_sreal;
 
-        // One row/contact dump per Newton iteration, at a genuinely local step.
-        // Global norms are still printed for every trial.
-        const bool detailed = !m_fdDetailedLogged && alpha <= 1e-3_sreal;
+        struct RowErrorCandidate
+        {
+            sofa::SignedIndex row = -1;
+            SReal fd = 0_sreal;
+            SReal predicted = 0_sreal;
+            SReal error = 0_sreal;
+            SReal relativeError = 0_sreal;
+            SReal score = 0_sreal;
+            bool signFlip = false;
+        };
+
+        std::vector<RowErrorCandidate> mechanicalCandidates;
+        std::vector<RowErrorCandidate> fbCandidates;
+
+        // Row-level diagnostics are intentionally emitted only once per Newton
+        // direction and only once the line-search step is genuinely local.
+        static constexpr SReal localAlphaThreshold = 1e-4_sreal;
+        static constexpr SReal localTranslationThreshold = 1e-3_sreal; // mm
+        static constexpr SReal relativeTolerance = 5e-2_sreal;
+        static constexpr SReal mechanicalAbsoluteTolerance = 1e-6_sreal;
+        static constexpr SReal fbAbsoluteTolerance = 1e-6_sreal;
+        static constexpr std::size_t maxRowsPerBlock = 2;
+
+        const NCPDebugDirectionSummary directionSummary = currentDirectionSummary();
+        const SReal stepMaxDx = directionSummary.valid
+            ? alpha * directionSummary.maximumNodeTranslation
+            : std::numeric_limits<SReal>::infinity();
+        const SReal stepMaxDlambda = directionSummary.valid
+            ? alpha * directionSummary.maximumAbsLambda
+            : std::numeric_limits<SReal>::infinity();
+
+        const bool localDiagnostic = !m_fdDetailedLogged
+            && (alpha <= localAlphaThreshold || stepMaxDx <= localTranslationThreshold);
 
         for (sofa::SignedIndex row = 0; row < rhs->size(); ++row)
         {
@@ -501,23 +638,7 @@ public:
             const SReal fd = (current - base) / alpha;
             const SReal predicted = m_fdJd[static_cast<std::size_t>(row)];
             const SReal error = fd - predicted;
-            const SReal predictedTrial = base + alpha * predicted;
             const bool mechanical = static_cast<sofa::Size>(row) < m_fdMechanicalDofs;
-
-            if (detailed)
-            {
-                msg_info(&m_owner) << "[NCP FD ROW] it=" << iteration
-                                   << " trial=" << trial
-                                   << " alpha=" << alpha
-                                   << " row=" << row
-                                   << " block=" << (mechanical ? "M" : "FB")
-                                   << " R0=" << base
-                                   << " Rtrial=" << current
-                                   << " Rpred=" << predictedTrial
-                                   << " dRfd=" << fd
-                                   << " Jd=" << predicted
-                                   << " err=" << error;
-            }
 
             error2 += error * error;
             fd2 += fd * fd;
@@ -535,7 +656,38 @@ public:
                 complementarityFD2 += fd * fd;
                 complementarityPredicted2 += predicted * predicted;
             }
+
+            if (!localDiagnostic)
+                continue;
+
+            const SReal absTol = mechanical ? mechanicalAbsoluteTolerance : fbAbsoluteTolerance;
+            const SReal scale = std::max(std::abs(fd), std::abs(predicted));
+            const SReal allowedError = std::max(absTol, relativeTolerance * scale);
+            const SReal absoluteError = std::abs(error);
+            const SReal score = absoluteError / std::max(allowedError, std::numeric_limits<SReal>::epsilon());
+            const SReal relativeError = absoluteError / std::max(scale, absTol);
+            const bool signFlip = std::abs(fd) > absTol && std::abs(predicted) > absTol && fd * predicted < 0_sreal;
+
+            if (score < 1_sreal && !signFlip)
+                continue;
+
+            RowErrorCandidate candidate;
+            candidate.row = row;
+            candidate.fd = fd;
+            candidate.predicted = predicted;
+            candidate.error = error;
+            candidate.relativeError = relativeError;
+            candidate.score = score;
+            candidate.signFlip = signFlip;
+
+            if (mechanical)
+                mechanicalCandidates.push_back(candidate);
+            else
+                fbCandidates.push_back(candidate);
         }
+
+        if (!localDiagnostic)
+            return;
 
         const SReal eps = std::numeric_limits<SReal>::epsilon();
         const SReal relScale = std::max({std::sqrt(fd2), std::sqrt(predicted2), eps});
@@ -545,20 +697,91 @@ public:
         const SReal mechRelErr = std::sqrt(mechanicalError2) / mechScale;
         const SReal fbRelErr = std::sqrt(complementarityError2) / fbScale;
 
-        msg_info(&m_owner) << "[NCP FD GLOBAL] it=" << iteration
-                           << " trial=" << trial
-                           << " alpha=" << alpha
-                           << " relErr=" << relErr
-                           << " mechRelErr=" << mechRelErr
-                           << " fbRelErr=" << fbRelErr
-                           << " |dRfd|=" << std::sqrt(fd2)
-                           << " |Jd|=" << std::sqrt(predicted2);
-
-        m_contact->logFiniteDifferenceTrial(static_cast<ContactForceField::Real>(alpha));
-        if (detailed)
+        auto sortCandidates = [](auto& candidates)
         {
-            m_fdDetailedLogged = true;
+            std::sort(candidates.begin(), candidates.end(), [](const RowErrorCandidate& a, const RowErrorCandidate& b)
+            {
+                if (a.signFlip != b.signFlip)
+                    return a.signFlip > b.signFlip;
+                return a.score > b.score;
+            });
+        };
+
+        sortCandidates(mechanicalCandidates);
+        sortCandidates(fbCandidates);
+
+        const SReal worstMechanical = mechanicalCandidates.empty() ? 0_sreal : mechanicalCandidates.front().score;
+        const SReal worstFB = fbCandidates.empty() ? 0_sreal : fbCandidates.front().score;
+        const bool suspicious = mechRelErr > 0.1_sreal || fbRelErr > 0.1_sreal
+                             || worstMechanical >= 1_sreal || worstFB >= 1_sreal;
+
+        if (suspicious)
+        {
+            msg_warning(&m_owner) << "[NCP FD SUSPECT]"
+                                  << " it=" << iteration
+                                  << " trial=" << trial
+                                  << " alpha=" << alpha
+                                  << " stepDx=" << stepMaxDx
+                                  << " stepDlambda=" << stepMaxDlambda
+                                  << " global=" << relErr
+                                  << " M=" << mechRelErr
+                                  << " FB=" << fbRelErr
+                                  << " Mbad=" << mechanicalCandidates.size()
+                                  << " FBbad=" << fbCandidates.size()
+                                  << " worstM=" << worstMechanical
+                                  << " worstFB=" << worstFB;
+
+            static constexpr const char* rigidLabels[6] = {"Fx", "Fy", "Fz", "Mx", "My", "Mz"};
+
+            const std::size_t mechanicalCount = std::min(maxRowsPerBlock, mechanicalCandidates.size());
+            for (std::size_t rank = 0; rank < mechanicalCount; ++rank)
+            {
+                const auto& c = mechanicalCandidates[rank];
+                const sofa::SignedIndex node = c.row / 6;
+                const sofa::SignedIndex component = c.row % 6;
+                const SReal decades = std::log10(std::max(c.score, 1_sreal));
+
+                msg_warning(&m_owner) << "[NCP FD TOP M]"
+                                      << " rank=" << rank + 1
+                                      << " row=" << c.row
+                                      << " node=" << node
+                                      << " dof=" << rigidLabels[component]
+                                      << " score=" << c.score
+                                      << " decades=" << decades
+                                      << " rel=" << c.relativeError
+                                      << " fd=" << c.fd
+                                      << " Jd=" << c.predicted
+                                      << " err=" << c.error
+                                      << " signFlip=" << c.signFlip;
+            }
+
+            const std::size_t fbCount = std::min(maxRowsPerBlock, fbCandidates.size());
+            for (std::size_t rank = 0; rank < fbCount; ++rank)
+            {
+                const auto& c = fbCandidates[rank];
+                const sofa::SignedIndex contactIndex = c.row - static_cast<sofa::SignedIndex>(m_fdMechanicalDofs);
+                const SReal decades = std::log10(std::max(c.score, 1_sreal));
+
+                msg_warning(&m_owner) << "[NCP FD TOP FB]"
+                                      << " rank=" << rank + 1
+                                      << " row=" << c.row
+                                      << " contact=" << contactIndex
+                                      << " score=" << c.score
+                                      << " decades=" << decades
+                                      << " rel=" << c.relativeError
+                                      << " fd=" << c.fd
+                                      << " Jd=" << c.predicted
+                                      << " err=" << c.error
+                                      << " signFlip=" << c.signFlip;
+            }
+
+            // Contact-level diagnostics are expensive/noisy. Evaluate them only
+            // for this one local suspicious trial; the contact logger itself
+            // reports only the worst contact and aggregate SDF-quality metrics.
+            m_contact->logFiniteDifferenceTrial(static_cast<ContactForceField::Real>(alpha));
         }
+
+        m_fdDetailedLogged = true;
     }
 
     /**
@@ -676,7 +899,6 @@ public:
         //
         //     grad(Psi)^T d_N = -negativeGradient^T d_N.
         const SReal newtonMeritSlope = -negativeGradientDotNewton;
-
         const SReal newtonNorm = std::sqrt(std::max(newtonNorm2, 0_sreal));
         // const SReal requiredSlope = -rho * std::pow(newtonNorm, exponent);
         const SReal requiredSlope = 0.0;
@@ -722,7 +944,10 @@ public:
 
         meritSlope = -gradientNorm2;
         usedGradientFallback = correctionIsFinite() && std::isfinite(static_cast<double>(meritSlope)) && meritSlope < 0_sreal;
-
+        msg_warning(&m_owner) << "[NCP Gradient Fallback]"
+                            << " Newton=" << newtonMeritSlope
+                            << " Criterion=" << requiredSlope
+                             << " gradPsi=" << -gradientNorm2;
         return usedGradientFallback;
     }
 
@@ -837,7 +1062,7 @@ public:
     {
         SCOPED_TIMER("NCPMechanicalLinearSolve");
 
-        assembleLinearizedSystem();
+        assembleLinearizedSystem(false);
 
         auto* system = m_linearSolver ? m_linearSolver->getLinearSystem() : nullptr;
         if (!system)
@@ -921,7 +1146,7 @@ public:
     }
 
 private:
-    const NCPStaticSolver& m_owner;
+    NCPStaticSolver& m_owner;
     MechanicalOperations& m_mechanicalOperations;
     core::behavior::MultiVecCoord& m_position;
     core::behavior::MultiVecDeriv& m_residual;
@@ -955,13 +1180,329 @@ private:
         return diagnostics.activeCount + diagnostics.pinnedCount + diagnostics.invalidCount;
     }
 
-    void assembleLinearizedSystem()
+    bool applyAdaptiveContactRegularization()
+    {
+        m_owner.d_lastContactSchurSigmaMinBefore.setValue(0_sreal);
+        m_owner.d_lastContactSchurSigmaMinAfter.setValue(0_sreal);
+        m_owner.d_lastContactSchurConditionBefore.setValue(0_sreal);
+        m_owner.d_lastAdaptiveContactRegularization.setValue(0_sreal);
+
+        if (!m_owner.d_adaptiveContactRegularization.getValue())
+            return true;
+
+        auto* system = m_linearSolver ? m_linearSolver->getLinearSystem() : nullptr;
+        auto* matrix = system ? system->getSystemBaseMatrix() : nullptr;
+        if (!matrix)
+            return false;
+
+        const sofa::SignedIndex rows = matrix->rowSize();
+        const sofa::SignedIndex cols = matrix->colSize();
+        const sofa::SignedIndex lambdaDofs = static_cast<sofa::SignedIndex>(lambdaDofCount());
+        const sofa::SignedIndex mechanicalDofs = rows - lambdaDofs;
+        const sofa::SignedIndex lambdaBegin = mechanicalDofs;
+
+        if (rows <= 0 || rows != cols || lambdaDofs <= 0 || mechanicalDofs <= 0)
+            return true;
+
+        // Prefer the exact current contact status when point-indexed debug data is
+        // being published. If publishing is disabled, infer the coupled rows from
+        // the already assembled mixed matrix. Pinned/invalid rows have H=0 and
+        // therefore no x-lambda coupling.
+        std::vector<sofa::SignedIndex> activeLocalIndices;
+        activeLocalIndices.reserve(static_cast<std::size_t>(lambdaDofs));
+
+        const auto& publishedStatus = m_contact->d_contactStatus.getValue();
+        const bool havePublishedStatus = m_contact->d_publishContactData.getValue()
+            && publishedStatus.size() == static_cast<std::size_t>(lambdaDofs);
+
+        if (havePublishedStatus)
+        {
+            for (sofa::SignedIndex local = 0; local < lambdaDofs; ++local)
+            {
+                if (publishedStatus[static_cast<std::size_t>(local)]
+                    == static_cast<unsigned int>(ContactRowStatus::Active))
+                {
+                    activeLocalIndices.push_back(local);
+                }
+            }
+        }
+        else
+        {
+            static constexpr SReal couplingTolerance2 = 1e-24_sreal;
+            static constexpr SReal pinnedDiagonalTolerance = 1e-6_sreal;
+
+            for (sofa::SignedIndex local = 0; local < lambdaDofs; ++local)
+            {
+                const sofa::SignedIndex global = lambdaBegin + local;
+                SReal coupling2 = 0_sreal;
+
+                for (sofa::SignedIndex i = 0; i < mechanicalDofs; ++i)
+                {
+                    const SReal upper = matrix->element(i, global);
+                    const SReal lower = matrix->element(global, i);
+                    coupling2 += upper * upper + lower * lower;
+                }
+
+                // A=-J. A pinned row has A_ll=-1 and no coupling. The diagonal
+                // fallback also catches an active row whose projected coupling is
+                // accidentally zero but whose FB diagonal differs from the pinned row.
+                const SReal jacobianDiagonal = -matrix->element(global, global);
+                const bool coupled = coupling2 > couplingTolerance2;
+                const bool nonPinnedDiagonal = std::abs(jacobianDiagonal - 1_sreal) > pinnedDiagonalTolerance;
+
+                if (coupled || nonPinnedDiagonal)
+                    activeLocalIndices.push_back(local);
+            }
+        }
+
+        const Eigen::Index activeCount = static_cast<Eigen::Index>(activeLocalIndices.size());
+        if (activeCount == 0)
+            return true;
+
+        const Eigen::Index nMechanical = static_cast<Eigen::Index>(mechanicalDofs);
+
+        Eigen::MatrixXd Axx(nMechanical, nMechanical);
+        Eigen::MatrixXd B(nMechanical, activeCount);
+        Eigen::MatrixXd C(activeCount, nMechanical);
+        Eigen::MatrixXd D(activeCount, activeCount);
+
+        for (Eigen::Index row = 0; row < nMechanical; ++row)
+        {
+            for (Eigen::Index col = 0; col < nMechanical; ++col)
+                Axx(row, col) = static_cast<double>(matrix->element(row, col));
+        }
+
+        for (Eigen::Index j = 0; j < activeCount; ++j)
+        {
+            const sofa::SignedIndex lambdaLocal = activeLocalIndices[static_cast<std::size_t>(j)];
+            const sofa::SignedIndex lambdaGlobal = lambdaBegin + lambdaLocal;
+
+            for (Eigen::Index i = 0; i < nMechanical; ++i)
+            {
+                B(i, j) = static_cast<double>(matrix->element(i, lambdaGlobal));
+                C(j, i) = static_cast<double>(matrix->element(lambdaGlobal, i));
+            }
+
+            for (Eigen::Index k = 0; k < activeCount; ++k)
+            {
+                const sofa::SignedIndex otherLocal = activeLocalIndices[static_cast<std::size_t>(k)];
+                const sofa::SignedIndex otherGlobal = lambdaBegin + otherLocal;
+                D(j, k) = static_cast<double>(matrix->element(lambdaGlobal, otherGlobal));
+            }
+        }
+
+        if (!Axx.allFinite() || !B.allFinite() || !C.allFinite() || !D.allFinite())
+        {
+            msg_warning(&m_owner) << "[NCP SCHUR REG] skipped: non-finite assembled block.";
+            return false;
+        }
+
+        // A=-J. Form the active Schur complement of A and negate it to obtain
+        // the reduced contact Jacobian:
+        //
+        //     S_A = D - C A_xx^{-1} B,
+        //     S_J = -S_A.
+        //
+        // A scalar tangent regularization +gamma I in J_ll therefore appears as
+        // -gamma I in the assembled A_ll block and shifts S_J by +gamma I.
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(Axx);
+        qr.setThreshold(1e-12);
+
+        if (qr.rank() < nMechanical)
+        {
+            msg_warning(&m_owner) << "[NCP SCHUR REG] skipped: mechanical block rank="
+                                  << qr.rank() << "/" << nMechanical
+                                  << ". Contact-only damping cannot regularize a singular A_xx.";
+            return false;
+        }
+
+        const Eigen::MatrixXd X = qr.solve(B);
+        const double solveDenominator = std::max(B.norm(), std::numeric_limits<double>::epsilon());
+        const double solveRelativeError = (Axx * X - B).norm() / solveDenominator;
+
+        if (!X.allFinite() || !std::isfinite(solveRelativeError) || solveRelativeError > 1e-7)
+        {
+            msg_warning(&m_owner) << "[NCP SCHUR REG] skipped: A_xx solve relErr="
+                                  << solveRelativeError << ".";
+            return false;
+        }
+
+        const Eigen::MatrixXd schurJ = -(D - C * X);
+
+        Eigen::JacobiSVD<Eigen::MatrixXd> svdBefore(schurJ, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        const Eigen::VectorXd singularValuesBefore = svdBefore.singularValues();
+        if (singularValuesBefore.size() == 0 || !singularValuesBefore.allFinite())
+            return false;
+
+        const SReal sigmaMaxBefore = static_cast<SReal>(singularValuesBefore[0]);
+        const SReal sigmaMinBefore = static_cast<SReal>(singularValuesBefore[singularValuesBefore.size() - 1]);
+        const SReal sigmaDenominator = std::max(sigmaMinBefore, std::numeric_limits<SReal>::epsilon());
+        const SReal conditionBefore = sigmaMaxBefore / sigmaDenominator;
+
+        m_owner.d_lastContactSchurSigmaMinBefore.setValue(sigmaMinBefore);
+        m_owner.d_lastContactSchurSigmaMinAfter.setValue(sigmaMinBefore);
+        m_owner.d_lastContactSchurConditionBefore.setValue(conditionBefore);
+
+        const SReal sigmaFloor = m_owner.d_contactSchurSingularValueFloor.getValue();
+        const SReal targetCondition = m_owner.d_contactSchurTargetConditionNumber.getValue();
+        const bool unsafeSigma = sigmaMinBefore < sigmaFloor;
+        const bool unsafeCondition = targetCondition > 1_sreal && conditionBefore > targetCondition;
+
+        if (!unsafeSigma && !unsafeCondition)
+        {
+            if (m_owner.d_logAdaptiveContactRegularization.getValue())
+            {
+                msg_info(&m_owner) << "[NCP SCHUR REG] active=" << activeCount
+                                   << " sigmaMin=" << sigmaMinBefore
+                                   << " sigmaMax=" << sigmaMaxBefore
+                                   << " cond=" << conditionBefore
+                                   << " addGamma=0";
+            }
+            return true;
+        }
+
+        // Closed-form initial shift from the symmetric part. If
+        //
+        //     H = 0.5 (S_J + S_J^T),
+        //
+        // then H(gamma)=H+gamma I, so its eigenvalues shift exactly by gamma.
+        // Enforcing lambda_min(H+gamma I)>=sigmaFloor is a sufficient (not
+        // necessary) condition for sigma_min(S_J+gamma I)>=sigmaFloor.
+        const Eigen::MatrixXd symmetricPart = 0.5 * (schurJ + schurJ.transpose());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(symmetricPart, Eigen::EigenvaluesOnly);
+        if (eigenSolver.info() != Eigen::Success || !eigenSolver.eigenvalues().allFinite())
+            return false;
+
+        const SReal lambdaMin = static_cast<SReal>(eigenSolver.eigenvalues()[0]);
+        const SReal lambdaMax = static_cast<SReal>(eigenSolver.eigenvalues()[eigenSolver.eigenvalues().size() - 1]);
+
+        SReal additionalGamma = std::max(0_sreal, sigmaFloor - lambdaMin);
+
+        if (targetCondition > 1_sreal)
+        {
+            const SReal numerator = lambdaMax - targetCondition * lambdaMin;
+            if (numerator > 0_sreal)
+            {
+                const SReal conditionShift = numerator / (targetCondition - 1_sreal);
+                additionalGamma = std::max(additionalGamma, conditionShift);
+            }
+        }
+
+        // The symmetric-part formula can be conservative for a nonsymmetric
+        // Schur block. Verify the actual singular values after the proposed shift.
+        // If needed, increase gamma geometrically until the requested SVD criteria
+        // are met or the user cap is reached.
+        const SReal maxAdditionalGamma = m_owner.d_contactSchurMaxAdditionalRegularization.getValue();
+        additionalGamma = std::min(additionalGamma, maxAdditionalGamma);
+
+        auto evaluateShift = [&](SReal gamma, SReal& sigmaMin, SReal& condition)
+        {
+            Eigen::MatrixXd shifted = schurJ;
+            shifted.diagonal().array() += static_cast<double>(gamma);
+
+            Eigen::JacobiSVD<Eigen::MatrixXd> svd(shifted, Eigen::ComputeThinU | Eigen::ComputeThinV);
+            const Eigen::VectorXd singularValues = svd.singularValues();
+
+            if (singularValues.size() == 0 || !singularValues.allFinite())
+                return false;
+
+            const SReal sigmaMax = static_cast<SReal>(singularValues[0]);
+            sigmaMin = static_cast<SReal>(singularValues[singularValues.size() - 1]);
+            condition = sigmaMax / std::max(sigmaMin, std::numeric_limits<SReal>::epsilon());
+            return true;
+        };
+
+        SReal sigmaMinAfter = sigmaMinBefore;
+        SReal conditionAfter = conditionBefore;
+
+        if (additionalGamma > 0_sreal)
+            evaluateShift(additionalGamma, sigmaMinAfter, conditionAfter);
+
+        auto shiftIsSafe = [&]()
+        {
+            const bool sigmaSafe = sigmaMinAfter >= sigmaFloor;
+            const bool conditionSafe = targetCondition <= 1_sreal || conditionAfter <= targetCondition;
+            return sigmaSafe && conditionSafe;
+        };
+
+        for (unsigned int attempt = 0; attempt < 8u && !shiftIsSafe() && additionalGamma < maxAdditionalGamma; ++attempt)
+        {
+            const SReal nextGamma = std::min(
+                maxAdditionalGamma,
+                std::max(2_sreal * additionalGamma, std::max(sigmaFloor, 1e-12_sreal)));
+
+            if (!(nextGamma > additionalGamma))
+                break;
+
+            additionalGamma = nextGamma;
+            if (!evaluateShift(additionalGamma, sigmaMinAfter, conditionAfter))
+                return false;
+        }
+
+        if (!(additionalGamma > 0_sreal))
+        {
+            msg_warning(&m_owner) << "[NCP SCHUR REG] unsafe contact Schur block but additional regularization is capped at zero.";
+            return false;
+        }
+
+        // The contact force field contributes +gamma to J_ll, while SOFA solves
+        // A=-J. Therefore increasing the tangent-only regularization by deltaGamma
+        // means subtracting deltaGamma from the assembled active lambda diagonal.
+        for (const sofa::SignedIndex local : activeLocalIndices)
+        {
+            const sofa::SignedIndex global = lambdaBegin + local;
+            matrix->set(global, global, matrix->element(global, global) - additionalGamma);
+        }
+
+        matrix->compress();
+
+        m_owner.d_lastContactSchurSigmaMinAfter.setValue(sigmaMinAfter);
+        m_owner.d_lastAdaptiveContactRegularization.setValue(additionalGamma);
+
+        const bool capped = !shiftIsSafe();
+
+        if (capped)
+        {
+            msg_warning(&m_owner) << "[NCP SCHUR REG] active=" << activeCount
+                                  << " sigmaMin=" << sigmaMinBefore
+                                  << " cond=" << conditionBefore
+                                  << " symEigMin=" << lambdaMin
+                                  << " symEigMax=" << lambdaMax
+                                  << " baseGamma=" << m_contact->d_contactNewtonRegularization.getValue()
+                                  << " addGamma=" << additionalGamma
+                                  << " totalGamma=" << m_contact->d_contactNewtonRegularization.getValue() + additionalGamma
+                                  << " sigmaMinAfter=" << sigmaMinAfter
+                                  << " condAfter=" << conditionAfter
+                                  << " capped=1";
+        }
+        else if (m_owner.d_logAdaptiveContactRegularization.getValue())
+        {
+            msg_info(&m_owner) << "[NCP SCHUR REG] active=" << activeCount
+                               << " sigmaMin=" << sigmaMinBefore
+                               << " cond=" << conditionBefore
+                               << " symEigMin=" << lambdaMin
+                               << " symEigMax=" << lambdaMax
+                               << " baseGamma=" << m_contact->d_contactNewtonRegularization.getValue()
+                               << " addGamma=" << additionalGamma
+                               << " totalGamma=" << m_contact->d_contactNewtonRegularization.getValue() + additionalGamma
+                               << " sigmaMinAfter=" << sigmaMinAfter
+                               << " condAfter=" << conditionAfter
+                               << " capped=0";
+        }
+
+        return !capped;
+    }
+
+    void assembleLinearizedSystem(bool applyAdaptiveRegularization = true)
     {
         SCOPED_TIMER("NCPJacobianAssembly");
         static constexpr core::MatricesFactors::M massFactor(0);
         static constexpr core::MatricesFactors::B dampingFactor(0);
         static constexpr core::MatricesFactors::K stiffnessFactor(-1);
         m_mechanicalOperations.setSystemMBKMatrix(massFactor,dampingFactor,stiffnessFactor,m_linearSolver);
+
+        if (applyAdaptiveRegularization)
+            applyAdaptiveContactRegularization();
     }
 
     /** Checkpoints are already projected; restoration only propagates mappings. */

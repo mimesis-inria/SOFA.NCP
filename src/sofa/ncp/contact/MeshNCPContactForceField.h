@@ -1,29 +1,38 @@
 /****************************************************************************
 * Triangle-mesh specialization of FischerBurmeisterContactForceField.
 *
-* The mesh is loaded directly from an OBJ file and queried through a static
-* AABB tree. The contact gap is the oriented tangent-plane distance
+* Geometry queries are delegated to EnclosedCollisionPlugin's
+* TriangleBVHCollisionModel, i.e. the same FCPW SAH/vectorized BVH used by the
+* enclosing collision pipeline.
+*
+* The nonlinear contact law uses a local tangent-plane gap
 *
 *     g(x) = (x - q) . n - contactOffset,
 *
-* where q is the closest point on the selected triangle and n points toward
-* the admissible lumen. Set flipNormals=true when the OBJ winding points in
-* the opposite direction.
+* where q is the closest mesh point and n is the oriented triangle normal
+* pointing toward the admissible lumen.
+*
+* This specialization intentionally supplies no gap Hessian. Consequently the
+* contact residual still uses the exact queried gap/normal, while the Newton
+* tangent is first-order in the contact geometry and contains no
+* lambda*Hess(g) term.
 ****************************************************************************/
 #pragma once
 
 #include <sofa/ncp/config.h>
 #include <sofa/ncp/contact/FischerBurmeisterContactForceField.h>
 
-#include <sofa/core/objectmodel/DataFileName.h>
+#include <EnclosedCollisionPlugin/TriangleBVHCollisionModel.h>
+
+#include <sofa/core/behavior/MechanicalState.h>
+#include <sofa/core/topology/BaseMeshTopology.h>
 #include <sofa/defaulttype/RigidTypes.h>
 #include <sofa/defaulttype/VecTypes.h>
-#include <sofa/type/Vec.h>
 #include <sofa/type/vector.h>
 
 #include <array>
 #include <limits>
-#include <string>
+#include <vector>
 
 namespace sofa::core { class ObjectFactory; }
 
@@ -42,21 +51,20 @@ public:
     using Inherit = FischerBurmeisterContactForceField<TDataTypes1, TDataTypes2>;
     using Real = typename Inherit::Real;
     using Vec3 = typename Inherit::Vec3;
+    using Mat3 = typename Inherit::Mat3;
     using Contact = typename Inherit::Contact;
     using ContactStatus = typename Inherit::ContactStatus;
+    using TriangleBVH = sofa::enclosedcollisionplugin::TriangleBVHCollisionModel;
+    using TriangleState = sofa::core::behavior::MechanicalState<sofa::defaulttype::Vec3Types>;
+    using TriangleTopology = sofa::core::topology::BaseMeshTopology;
 
-    enum NormalMode : unsigned int
-    {
-        FaceNormal = 0,
-        InterpolatedVertexNormal = 1
-    };
+    SingleLink<MeshNCPContactForceField, TriangleBVH,
+        BaseLink::FLAG_STOREPATH | BaseLink::FLAG_STRONGLINK> l_triangleCollisionModel;
 
-    sofa::core::objectmodel::DataFileName d_meshFilename;
     Data<bool> d_flipNormals;
-    Data<unsigned int> d_normalMode;
     Data<Real> d_contactOffset;
-    Data<Real> d_maxSearchDistance;
-    Data<unsigned int> d_bvhLeafSize;
+    Data<Real> d_proximityThreshold;
+    Data<bool> d_useBatchQueries;
     Data<bool> d_ignoreBoundaryEdges;
     Data<Real> d_boundaryBarycentricTolerance;
     Data<sofa::type::vector<unsigned int>> d_pinnedIndices;
@@ -74,72 +82,30 @@ public:
 
 protected:
     ContactStatus computeContactKinematics(const Vec3& position, Contact& contact) const override;
+    bool computeGapHessian(const Vec3&, Mat3& hessian) const override;
 
 private:
     static constexpr sofa::Index InvalidIndex = std::numeric_limits<sofa::Index>::max();
 
-    struct FaceCorner
-    {
-        sofa::Index vertex = InvalidIndex;
-        sofa::Index normal = InvalidIndex;
-    };
+    TriangleState* m_triangleState { nullptr };
+    TriangleTopology* m_triangleTopology { nullptr };
+    sofa::type::vector<std::array<bool, 3>> m_boundaryEdges;
 
-    struct Triangle
-    {
-        std::array<sofa::Index, 3> vertex { InvalidIndex, InvalidIndex, InvalidIndex };
-        std::array<sofa::Index, 3> normal { InvalidIndex, InvalidIndex, InvalidIndex };
-        std::array<bool, 3> boundaryEdge { false, false, false };
-        Vec3 faceNormal = Vec3(Real(0), Real(0), Real(0));
-        Vec3 minimum = Vec3(Real(0), Real(0), Real(0));
-        Vec3 maximum = Vec3(Real(0), Real(0), Real(0));
-        Vec3 centroid = Vec3(Real(0), Real(0), Real(0));
-    };
+    mutable int m_cachedPositionCounter { -1 };
+    mutable sofa::Size m_cachedPointCount { 0 };
+    mutable std::vector<TriangleBVH::ClosestTriangleResult> m_closestResults;
 
-    struct BvhNode
-    {
-        Vec3 minimum = Vec3(Real(0), Real(0), Real(0));
-        Vec3 maximum = Vec3(Real(0), Real(0), Real(0));
-        sofa::Index left = InvalidIndex;
-        sofa::Index right = InvalidIndex;
-        sofa::Size begin = 0;
-        sofa::Size count = 0;
-
-        bool isLeaf() const { return count != 0; }
-    };
-
-    struct ClosestPointResult
-    {
-        sofa::Index triangle = InvalidIndex;
-        Vec3 point = Vec3(Real(0), Real(0), Real(0));
-        Vec3 barycentric = Vec3(Real(0), Real(0), Real(0));
-        Real squaredDistance = std::numeric_limits<Real>::max();
-    };
-
-    sofa::type::vector<Vec3> m_vertices;
-    sofa::type::vector<Vec3> m_objNormals;
-    sofa::type::vector<Vec3> m_generatedVertexNormals;
-    sofa::type::vector<Triangle> m_triangles;
-    sofa::type::vector<sofa::Index> m_triangleOrder;
-    sofa::type::vector<BvhNode> m_bvhNodes;
-
-    bool loadMesh();
-    bool loadObj(const std::string& filename);
-    bool finalizeMesh();
-    bool buildBvh();
-    sofa::Index buildBvhNode(sofa::Size begin, sofa::Size end);
-
-    bool findClosestPoint(const Vec3& position, ClosestPointResult& result) const;
-    void queryBvhNode(sofa::Index nodeIndex, const Vec3& position, ClosestPointResult& result) const;
-    Vec3 contactNormal(const Triangle& triangle, const Vec3& barycentric) const;
-    bool liesOnIgnoredBoundary(const Triangle& triangle, const Vec3& barycentric) const;
+    bool initializeMeshOracle();
+    bool rebuildBoundaryCache();
+    bool ensureClosestPointCache() const;
+    bool queryClosestPoint(const Vec3& position, sofa::Index pointIndex,
+        TriangleBVH::ClosestTriangleResult& result) const;
+    bool triangleNormal(sofa::Index triangleIndex, Vec3& normal) const;
+    bool liesOnIgnoredBoundary(sofa::Index triangleIndex, const Vec3& closestPoint) const;
     bool isPinned(sofa::Index pointIndex) const;
 
-    static bool parseFaceCorner(const std::string& token, sofa::Size vertexCount,
-        sofa::Size normalCount, FaceCorner& corner);
-    static bool resolveObjIndex(long long rawIndex, sofa::Size count, sofa::Index& resolvedIndex);
-    static Vec3 closestPointOnTriangle(const Vec3& position, const Vec3& a,
-        const Vec3& b, const Vec3& c, Vec3& barycentric);
-    static Real squaredDistanceToBox(const Vec3& position, const Vec3& minimum, const Vec3& maximum);
+    static bool barycentricCoordinates(const Vec3& p, const Vec3& a, const Vec3& b,
+        const Vec3& c, Vec3& barycentric);
     static Real dot(const Vec3& a, const Vec3& b);
     static Vec3 cross(const Vec3& a, const Vec3& b);
     static bool normalize(Vec3& value);

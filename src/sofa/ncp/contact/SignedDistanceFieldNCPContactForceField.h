@@ -36,6 +36,19 @@
 *       Full tensor-product tricubic Hermite using f, fx, fy, fz, fxy, fxz,
 *       fyz, fxyz at the 8 cell corners.
 *
+* Geometric stiffness modes:
+*   0 None
+*       Drop lambda Hess(g) from the Newton tangent.
+*
+*   1 ExactSDFHessian
+*       Use the analytic Hessian of the selected SDF interpolant.
+*
+*   2 MacklinDiagonal
+*       Replace the exact Hessian by a diagonal secant approximation built
+*       from successive accepted Newton bases. The solver-side shift
+*       -lambda Hess(g) is clamped positive component-wise, following the
+*       geometric-stiffness strategy of Macklin et al.
+*
 * Raw files:
 *   sdfFilename                 : float32 phi[ix,iy,iz], C-order, z fastest.
 *   sdfGradientFilename          : optional float32 [fx,fy,fz] per grid node.
@@ -95,6 +108,13 @@ public:
         HermiteFull = 4
     };
 
+    enum GeometricStiffnessMode : unsigned int
+    {
+        NoGeometricStiffness = 0,
+        ExactSDFHessian = 1,
+        MacklinDiagonal = 2
+    };
+
     struct HermiteMixedDerivatives
     {
         Real fxy = Real(0);
@@ -118,6 +138,12 @@ public:
     /// Normalize grad(phi) before returning gapGradient. Keep false for an exact derivative of the interpolated gap.
     Data<bool> d_normalizeGradient;
 
+    /// 0=None, 1=exact SDF Hessian, 2=Macklin-style diagonal secant approximation.
+    Data<unsigned int> d_geometricStiffnessMode;
+
+    /// Minimum accepted-base displacement component used by the Macklin secant [mm].
+    Data<Real> d_macklinSecantMinDisplacement;
+
     Data<bool> d_debugQueries;
     Data<bool> d_showGridBox;
     Data<sofa::type::RGBAColor> d_color;
@@ -132,6 +158,7 @@ protected:
 public:
     void init() override;
     void reinit() override;
+    void buildStiffnessMatrix(core::behavior::StiffnessMatrix* matrix) override;
     void draw(const core::visual::VisualParams* vparams) override;
 
 protected:
@@ -161,6 +188,11 @@ protected:
     HermiteMixedDerivatives mixedAt(unsigned int i, unsigned int j, unsigned int k) const;
 
     static const char* interpolationModeName(unsigned int mode);
+    static const char* geometricStiffnessModeName(unsigned int mode);
+
+    void resetMacklinGeometricStiffness();
+    void updateMacklinGeometricStiffness();
+    bool findMacklinPointIndex(const Vec3& p, sofa::Index& pointIndex) const;
 
     void drawGridBox(const core::visual::VisualParams* vparams) const;
 
@@ -177,6 +209,15 @@ protected:
     bool m_loaded = false;
     bool m_hasHermiteFirstDerivatives = false;
     bool m_hasHermiteMixedDerivatives = false;
+
+    // Macklin-style diagonal geometric-stiffness history. The history advances
+    // only from buildStiffnessMatrix(), i.e. at assembled Newton bases, never
+    // from residual-only line-search evaluations.
+    std::vector<Vec3> m_macklinBasePositions;
+    std::vector<Vec3> m_macklinBaseGapGradients;
+    std::vector<ContactStatus> m_macklinBaseStatus;
+    std::vector<Mat3> m_macklinGapHessians;
+    bool m_macklinHistoryValid = false;
 
     mutable bool m_warnedMissingFirstDerivatives = false;
     mutable bool m_warnedMissingFullHermite = false;

@@ -50,9 +50,21 @@ public:
     Data<bool> d_debug;
     Data<bool> d_finiteDifferenceCheck;
 
+    // Adaptive tangent-only regularization of the active contact Schur block.
+    // The physical FB residual is unchanged; only the Newton matrix is modified.
+    Data<bool> d_adaptiveContactRegularization;
+    Data<SReal> d_contactSchurSingularValueFloor;
+    Data<SReal> d_contactSchurTargetConditionNumber;
+    Data<SReal> d_contactSchurMaxAdditionalRegularization;
+    Data<bool> d_logAdaptiveContactRegularization;
+
     Data<SReal> d_lastMechanicalResidualNorm;
     Data<SReal> d_lastComplementarityResidualNorm;
     Data<bool> d_lastComplianceCaptureSucceeded;
+    Data<SReal> d_lastContactSchurSigmaMinBefore;
+    Data<SReal> d_lastContactSchurSigmaMinAfter;
+    Data<SReal> d_lastContactSchurConditionBefore;
+    Data<SReal> d_lastAdaptiveContactRegularization;
 
 protected:
     core::MultiVecCoordId m_solveStateId;

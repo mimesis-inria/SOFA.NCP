@@ -7,10 +7,8 @@ using namespace sofa;
 
 #define SOFANCP_VERSION "@PROJECT_VERSION@"
 
-// TODO: fix this, it should be inside the #ifdef SOFA_BUILD_SOFANCP
-#define SOFA_TARGET @PROJECT_NAME@
-
 #ifdef SOFA_BUILD_SOFANCP
+#  define SOFA_TARGET @PROJECT_NAME@
 #  define SOFANCP_API SOFA_EXPORT_DYNAMIC_LIBRARY
 #else
 #  define SOFANCP_API SOFA_IMPORT_DYNAMIC_LIBRARY

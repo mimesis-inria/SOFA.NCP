@@ -67,6 +67,7 @@ public:
     virtual NCPDebugResidualSummary currentNCPDebugSummary() const = 0;
     virtual NCPDebugDirectionSummary currentDirectionSummary() const = 0;
     virtual bool correctionIsFinite() const = 0;
+    virtual bool solveLevenbergMarquardt(SReal muLambda) = 0;
 
     // Optional directional finite-difference diagnostic. The backend snapshots
     // the accepted Newton base after the final search direction is selected,
@@ -132,6 +133,10 @@ public:
     Data<bool> d_logIterationSummary;
     Data<bool> d_logLineSearchTrials;
     Data<unsigned int> d_nonMonotoneWindow;
+    Data<bool> d_enableLMFallback;
+    Data<SReal> d_lmInitialDamping;
+    Data<unsigned int> d_lmMaxRetries;
+    Data<unsigned int> d_lmStagnationIterations;
     Data<unsigned int> d_lastAcceptedNewtonUpdates;
     Data<SReal> d_lastAcceptedAlpha;
     Data<std::string> d_lastFailureReason;

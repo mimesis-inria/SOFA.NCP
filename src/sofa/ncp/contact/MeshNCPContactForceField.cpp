@@ -9,7 +9,7 @@ namespace sofa::ncp
 void registerMeshNCPContactForceField(sofa::core::ObjectFactory* factory)
 {
     factory->registerObjects(core::ObjectRegistrationData(
-        "Fischer-Burmeister contact against a directly queried OBJ triangle mesh.")
+        "Fischer-Burmeister contact using EnclosedCollisionPlugin's FCPW triangle BVH.")
         .add<MeshNCPContactForceField<defaulttype::Rigid3Types, defaulttype::Vec1Types>>()
         .add<MeshNCPContactForceField<defaulttype::Vec3Types, defaulttype::Vec1Types>>());
 }

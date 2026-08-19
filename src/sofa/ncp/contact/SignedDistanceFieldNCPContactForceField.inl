@@ -7,8 +7,10 @@
 #include <sofa/ncp/contact/FischerBurmeisterContactForceField.inl>
 #include <sofa/core/visual/VisualParams.h>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 namespace sofa::ncp
@@ -26,6 +28,8 @@ SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::SignedDistanc
     , d_dimensions(this->initData(&d_dimensions, UInt3(0, 0, 0), "sdfDimensions", "Grid dimensions nx ny nz."))
     , d_interpolationMode(this->initData(&d_interpolationMode, static_cast<unsigned int>(Cubic64), "interpolationMode", "0=Auto, 1=Linear8, 2=Cubic64, 3=HermiteFirstDerivatives, 4=HermiteFull."))
     , d_normalizeGradient(this->initData(&d_normalizeGradient, false, "normalizeGradient", "Normalize grad(phi) before returning gapGradient. This changes the Jacobian unless phi is an exact SDF."))
+    , d_geometricStiffnessMode(this->initData(&d_geometricStiffnessMode, static_cast<unsigned int>(ExactSDFHessian), "geometricStiffnessMode", "0=None, 1=ExactSDFHessian, 2=MacklinDiagonal."))
+    , d_macklinSecantMinDisplacement(this->initData(&d_macklinSecantMinDisplacement, Real(1e-6), "macklinSecantMinDisplacement", "Minimum accepted-base displacement component used by the Macklin diagonal secant [mm]."))
     , d_debugQueries(this->initData(&d_debugQueries, true, "debugQueries", "Log invalid, out-of-grid, boundary-fallback, and interpolation queries."))
     , d_showGridBox(this->initData(&d_showGridBox, false, "showGridBox", "Draw SDF grid bounding box."))
     , d_color(this->initData(&d_color, sofa::type::RGBAColor(0.1f, 0.8f, 1.0f, 1.0f), "color", "SDF grid box draw color."))
@@ -71,6 +75,18 @@ const char* SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::i
 }
 
 template<class TDataTypes1, class TDataTypes2>
+const char* SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::geometricStiffnessModeName(unsigned int mode)
+{
+    switch (mode)
+    {
+    case NoGeometricStiffness: return "None";
+    case ExactSDFHessian: return "ExactSDFHessian";
+    case MacklinDiagonal: return "MacklinDiagonal";
+    default: return "Unknown";
+    }
+}
+
+template<class TDataTypes1, class TDataTypes2>
 void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::clearGridData()
 {
     m_phi.clear();
@@ -87,6 +103,8 @@ void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::clearGri
     m_loaded = false;
     m_hasHermiteFirstDerivatives = false;
     m_hasHermiteMixedDerivatives = false;
+
+    resetMacklinGeometricStiffness();
 
     m_warnedMissingFirstDerivatives = false;
     m_warnedMissingFullHermite = false;
@@ -228,7 +246,8 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::loadGrid
                << " interpolationMode=" << interpolationModeName(d_interpolationMode.getValue())
                << " hasFirstDerivatives=" << m_hasHermiteFirstDerivatives
                << " hasMixedDerivatives=" << m_hasHermiteMixedDerivatives
-               << " normalizeGradient=" << d_normalizeGradient.getValue();
+               << " normalizeGradient=" << d_normalizeGradient.getValue()
+               << " geometricStiffnessMode=" << geometricStiffnessModeName(d_geometricStiffnessMode.getValue());
 
     return true;
 }
@@ -280,8 +299,7 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::validate
         !std::isfinite(gradPhi[1]) ||
         !std::isfinite(gradPhi[2]))
     {
-        if (d_debugQueries.getValue()) msg_warning() << "[SDF invalid] non-finite interpolation p=" << p
-                      << " phi=" << phi << " grad=" << gradPhi;
+        msg_warning() << "[SDF invalid] non-finite interpolation p=" << p << " phi=" << phi << " grad=" << gradPhi;
         return false;
     }
 
@@ -434,9 +452,9 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
         gy < Real(0) || gy >= Real(m_ny - 1) ||
         gz < Real(0) || gz >= Real(m_nz - 1))
     {
-        if (d_debugQueries.getValue()) msg_info() << "[SDF invalid] out of grid p=" << p
-                   << " grid=(" << gx << ", " << gy << ", " << gz << ")"
-                   << " dims=(" << m_nx << ", " << m_ny << ", " << m_nz << ")";
+        // if (d_debugQueries.getValue()) msg_info() << "[SDF invalid] out of grid p=" << p
+        //            << " grid=(" << gx << ", " << gy << ", " << gz << ")"
+        //            << " dims=(" << m_nx << ", " << m_ny << ", " << m_nz << ")";
         return false;
     }
 
@@ -666,48 +684,65 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
 }
 
 template<class TDataTypes1, class TDataTypes2>
-bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::computeGapHessian(const Vec3& p,Mat3& hessian) const
+bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::computeGapHessian(const Vec3& p, Mat3& hessian) const
 {
     hessian.clear();
+
+    const unsigned int geometricMode = d_geometricStiffnessMode.getValue();
+
+    if (geometricMode == NoGeometricStiffness)
+        return false;
+
+    if (geometricMode == MacklinDiagonal)
+    {
+        sofa::Index pointIndex = 0;
+        if (!findMacklinPointIndex(p, pointIndex) || pointIndex >= m_macklinGapHessians.size())
+            return false;
+
+        hessian = m_macklinGapHessians[pointIndex];
+        return true;
+    }
+
+    if (geometricMode != ExactSDFHessian)
+        return false;
 
     if (!m_loaded || m_phi.empty())
         return false;
 
-    // When normalizeGradient=true, computeContactKinematics returns
-    //     H = -grad(phi) / ||grad(phi)||,
-    // while gap itself remains g=-phi. H is therefore no longer dg/dx in
-    // general, so -Hess(phi) would not be the derivative of the force
-    // direction used by the base class. Do not inject an inconsistent J_xx.
+    // With normalized gradients the contact force direction is no longer the
+    // exact derivative of g=-phi, so the analytic -Hess(phi) is inconsistent.
+    // The Macklin mode remains valid because it finite-differences the actual
+    // gapGradient returned by computeContactKinematics().
     if (d_normalizeGradient.getValue())
         return false;
 
     Mat3 hessianPhi;
     hessianPhi.clear();
 
-    const unsigned int mode = d_interpolationMode.getValue();
+    const unsigned int interpolationMode = d_interpolationMode.getValue();
     bool valid = false;
 
-    if (mode == Auto)
+    if (interpolationMode == Auto)
     {
         valid = m_hasHermiteFirstDerivatives && m_hasHermiteMixedDerivatives
             ? evaluateHermiteCellHessian(p, true, hessianPhi)
             : evaluateCubic64Hessian(p, hessianPhi);
     }
-    else if (mode == Linear8)
+    else if (interpolationMode == Linear8)
     {
         valid = evaluateLinear8Hessian(p, hessianPhi);
     }
-    else if (mode == Cubic64)
+    else if (interpolationMode == Cubic64)
     {
         valid = evaluateCubic64Hessian(p, hessianPhi);
     }
-    else if (mode == HermiteFirstDerivatives)
+    else if (interpolationMode == HermiteFirstDerivatives)
     {
         valid = m_hasHermiteFirstDerivatives
             ? evaluateHermiteCellHessian(p, false, hessianPhi)
             : evaluateCubic64Hessian(p, hessianPhi);
     }
-    else if (mode == HermiteFull)
+    else if (interpolationMode == HermiteFull)
     {
         valid = m_hasHermiteFirstDerivatives && m_hasHermiteMixedDerivatives
             ? evaluateHermiteCellHessian(p, true, hessianPhi)
@@ -721,7 +756,7 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::computeG
     if (!valid)
         return false;
 
-    // NCP convention: g = -phi, hence Hess(g) = -Hess(phi).
+    // g=-phi, hence Hess(g)=-Hess(phi).
     for (sofa::Size row = 0; row < 3; ++row)
     {
         for (sofa::Size col = 0; col < 3; ++col)
@@ -1046,6 +1081,181 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
     hessianPhi(1, 2) = hessianPhi(2, 1) = dvw / (hy * hz);
 
     return true;
+}
+
+template<class TDataTypes1, class TDataTypes2>
+void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::resetMacklinGeometricStiffness()
+{
+    m_macklinBasePositions.clear();
+    m_macklinBaseGapGradients.clear();
+    m_macklinBaseStatus.clear();
+    m_macklinGapHessians.clear();
+    m_macklinHistoryValid = false;
+}
+
+template<class TDataTypes1, class TDataTypes2>
+bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::findMacklinPointIndex(
+    const Vec3& p, sofa::Index& pointIndex) const
+{
+    if (!m_macklinHistoryValid || m_macklinBasePositions.empty())
+        return false;
+
+    Real coordinateScale = Real(1);
+    for (sofa::Size d = 0; d < 3; ++d)
+        coordinateScale = std::max(coordinateScale, std::abs(p[d]));
+
+    const Real tolerance = Real(64) * std::numeric_limits<Real>::epsilon() * coordinateScale;
+    const Real tolerance2 = tolerance * tolerance;
+
+    for (sofa::Index i = 0; i < m_macklinBasePositions.size(); ++i)
+    {
+        const Vec3 delta = p - m_macklinBasePositions[i];
+        if (delta.norm2() <= tolerance2)
+        {
+            pointIndex = i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+template<class TDataTypes1, class TDataTypes2>
+void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::updateMacklinGeometricStiffness()
+{
+    if (!this->mstate1 || this->m_contacts.empty())
+        return;
+
+    const auto xData = this->mstate1->read(core::vec_id::read_access::position);
+    const auto& x = xData->getValue();
+    const sofa::Size count = x.size();
+
+    if (count == 0 || this->m_contacts.size() != count)
+    {
+        resetMacklinGeometricStiffness();
+        return;
+    }
+
+    std::vector<Vec3> currentPositions(count);
+    for (sofa::Index i = 0; i < count; ++i)
+        currentPositions[i] = this->extractPosition(x[i]);
+
+    if (!m_macklinHistoryValid
+        || m_macklinBasePositions.size() != count
+        || m_macklinBaseGapGradients.size() != count
+        || m_macklinBaseStatus.size() != count)
+    {
+        m_macklinBasePositions = currentPositions;
+        m_macklinBaseGapGradients.resize(count);
+        m_macklinBaseStatus.resize(count);
+        m_macklinGapHessians.resize(count);
+
+        for (sofa::Index i = 0; i < count; ++i)
+        {
+            m_macklinBaseGapGradients[i] = this->m_contacts[i].gapGradient;
+            m_macklinBaseStatus[i] = this->m_contacts[i].status;
+            m_macklinGapHessians[i].clear();
+        }
+
+        m_macklinHistoryValid = true;
+        return;
+    }
+
+    const Real minStep = std::max(d_macklinSecantMinDisplacement.getValue(), Real(0));
+    const Real minStep2 = minStep * minStep;
+
+    bool baseChanged = false;
+    for (sofa::Index i = 0; i < count && !baseChanged; ++i)
+    {
+        const Vec3 dx = currentPositions[i] - m_macklinBasePositions[i];
+        baseChanged = dx.norm2() > minStep2;
+    }
+
+    // buildStiffnessMatrix() can be called more than once at the same Newton
+    // base. Do not advance the secant history or erase the current estimate.
+    if (!baseChanged)
+        return;
+
+    std::vector<Mat3> currentHessians(count);
+    sofa::Size activeSecants = 0;
+    Real minimumSolverShift = std::numeric_limits<Real>::infinity();
+    Real maximumSolverShift = Real(0);
+
+    for (sofa::Index i = 0; i < count; ++i)
+    {
+        Mat3& hessian = currentHessians[i];
+        hessian.clear();
+
+        const Contact& current = this->m_contacts[i];
+        if (current.status != ContactStatus::Active
+            || m_macklinBaseStatus[i] != ContactStatus::Active
+            || !(current.lambda > Real(0)))
+        {
+            continue;
+        }
+
+        const Vec3 dx = currentPositions[i] - m_macklinBasePositions[i];
+        const Vec3 dH = current.gapGradient - m_macklinBaseGapGradients[i];
+        bool contactUsed = false;
+
+        for (sofa::Size d = 0; d < 3; ++d)
+        {
+            // if (std::abs(dx[d]) <= minStep)
+            //     continue;
+
+            // Secant estimate q ~= dH_d/dx_d ~= Hess(g)_dd.
+            // The SOFA system matrix is A=-J, so its geometric contribution is
+            //     A_g = -lambda Hess(g).
+            // Macklin's positive clamp therefore retains only q<0 for lambda>0.
+            const Real q = dH[d] / dx[d];
+            if (!std::isfinite(static_cast<double>(q)) || !(q < Real(0)))
+                continue;
+
+            hessian(d, d) = q;
+            contactUsed = true;
+
+            const Real solverShift = -current.lambda * q;
+            minimumSolverShift = std::min(minimumSolverShift, solverShift);
+            maximumSolverShift = std::max(maximumSolverShift, solverShift);
+        }
+
+        if (contactUsed)
+            ++activeSecants;
+    }
+
+    m_macklinGapHessians = std::move(currentHessians);
+    m_macklinBasePositions = std::move(currentPositions);
+    m_macklinBaseGapGradients.resize(count);
+    m_macklinBaseStatus.resize(count);
+
+    for (sofa::Index i = 0; i < count; ++i)
+    {
+        m_macklinBaseGapGradients[i] = this->m_contacts[i].gapGradient;
+        m_macklinBaseStatus[i] = this->m_contacts[i].status;
+    }
+
+    if (d_debugQueries.getValue())
+    {
+        msg_info() << "[SDF Macklin geometric stiffness] contacts=" << count
+                   << " activeSecants=" << activeSecants
+                   << " solverShift[min/max]="
+                   << (activeSecants > 0 ? minimumSolverShift : Real(0))
+                   << "/" << maximumSolverShift;
+    }
+}
+
+template<class TDataTypes1, class TDataTypes2>
+void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::buildStiffnessMatrix(
+    core::behavior::StiffnessMatrix* matrix)
+{
+    const unsigned int mode = d_geometricStiffnessMode.getValue();
+
+    if (mode == MacklinDiagonal)
+        updateMacklinGeometricStiffness();
+    else if (mode != ExactSDFHessian && mode != NoGeometricStiffness)
+        msg_warning() << "Unknown geometricStiffnessMode=" << mode << ". Geometric stiffness disabled.";
+
+    Base::buildStiffnessMatrix(matrix);
 }
 
 template<class TDataTypes1, class TDataTypes2>

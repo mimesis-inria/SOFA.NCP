@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -33,6 +34,9 @@ FischerBurmeisterContactForceField<T1, T2>::FischerBurmeisterContactForceField()
           "complianceMode", "0=fixed, 1=lagged reference-elastic scale, 2=current scale (reserved)."))
     , d_fbEpsilon(initData(&d_fbEpsilon, Real(0),
           "fbEpsilon", "Nonnegative Fischer-Burmeister smoothing epsilon."))
+    , d_contactNewtonRegularization(initData(&d_contactNewtonRegularization, Real(0.0),
+          "contactNewtonRegularization",
+          "Nonnegative tangent-only diagonal regularization added to active lambda rows."))
     , l_beamForceField(initLink("beamForceField",
           "BeamFEMForceField providing the constant positive reference elastic metric."))
     , l_fixedConstraint(initLink("fixedConstraint",
@@ -58,6 +62,15 @@ FischerBurmeisterContactForceField<T1, T2>::FischerBurmeisterContactForceField()
     , d_activeContactCount(initData(&d_activeContactCount, sofa::Size(0), "activeContactCount", "Active FB rows."))
     , d_pinnedContactCount(initData(&d_pinnedContactCount, sofa::Size(0), "pinnedContactCount", "Pinned rows."))
     , d_invalidContactCount(initData(&d_invalidContactCount, sofa::Size(0), "invalidContactCount", "Invalid rows."))
+    , d_referenceDelassus(initData(&d_referenceDelassus,
+          "referenceDelassus",
+          "Flattened row-major active-contact W_ref = H K_ref^{-1} H^T."))
+    , d_referenceDelassusLambdaIndices(initData(&d_referenceDelassusLambdaIndices,
+        "referenceDelassusLambdaIndices",
+        "Lambda MechanicalState index associated with each W_ref row/column."))
+    , d_referenceDelassusSize(initData(&d_referenceDelassusSize, sofa::Size(0),
+        "referenceDelassusSize",
+        "Number of active rows/columns in referenceDelassus."))
 {
     static_assert(T1::spatial_dimensions >= TranslationalDim,
         "Object1 must expose at least three translational DOFs.");
@@ -76,6 +89,9 @@ FischerBurmeisterContactForceField<T1, T2>::FischerBurmeisterContactForceField()
     d_activeContactCount.setReadOnly(true);
     d_pinnedContactCount.setReadOnly(true);
     d_invalidContactCount.setReadOnly(true);
+    d_referenceDelassus.setReadOnly(true);
+    d_referenceDelassusLambdaIndices.setReadOnly(true);
+    d_referenceDelassusSize.setReadOnly(true);
 }
 
 template<class T1, class T2>
@@ -134,6 +150,14 @@ bool FischerBurmeisterContactForceField<T1, T2>::initializeContactRows()
         || !std::isfinite(static_cast<double>(d_fbEpsilon.getValue())))
     {
         msg_error() << "fbEpsilon must be finite and nonnegative.";
+        m_validState = false;
+        return false;
+    }
+
+    if (!(d_contactNewtonRegularization.getValue() >= Real(0))
+        || !std::isfinite(static_cast<double>(d_contactNewtonRegularization.getValue())))
+    {
+        msg_error() << "contactNewtonRegularization must be finite and nonnegative.";
         m_validState = false;
         return false;
     }
@@ -238,10 +262,6 @@ void FischerBurmeisterContactForceField<T1, T2>::beginNonlinearSolve()
         m_hasNextCompliance = false;
         m_hasCurrentCompliance = true;
         ++m_complianceGeneration;
-
-        if (d_debug.getValue())
-            msg_info() << "[NCP SCALE PROMOTE] generation=" << m_complianceGeneration
-                       << " points=" << m_currentCompliance.size();
     }
 
     if (m_hasCurrentCompliance && m_currentCompliance.size() != expectedPoints)
@@ -256,9 +276,6 @@ void FischerBurmeisterContactForceField<T1, T2>::discardLaggedComplianceSnapshot
 {
     m_nextCompliance.clear();
     m_hasNextCompliance = false;
-
-    if (d_debug.getValue() && usesLaggedCompliance())
-        msg_info() << "[NCP SCALE DISCARD]";
 }
 
 template<class T1, class T2>
@@ -303,17 +320,6 @@ void FischerBurmeisterContactForceField<T1, T2>::updateFischerBurmeisterTerms(Co
     const Real r = c.complianceScale;
     const Real contactCompliance = 0;
 
-    // Compliant unilateral gap:
-    
-    //     g_eff = g + c_n * lambda
-    
-    // Active contact therefore tends toward
-    
-    //     g + c_n * lambda = 0
-    
-    // or
-    
-    //     lambda = -g / c_n.
     const Real effectiveGap = c.gap + contactCompliance * c.lambda;
     const Real s = r * c.lambda;
     const Real n = std::sqrt(effectiveGap * effectiveGap+ s * s+ eps * eps);
@@ -347,7 +353,7 @@ FischerBurmeisterContactForceField<T1, T2>::complianceForPoint(sofa::Index point
 template<class T1, class T2>
 void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, ContactStatus geometryStatus, Real fixedR) const
 {
-    if (geometryStatus == ContactStatus::Pinned)
+    if (geometryStatus == ContactStatus::Pinned || c.gap >= 0.5)
     {
         c.status = ContactStatus::Pinned;
         c.gap = Real(0);
@@ -415,9 +421,67 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildCurrentContacts(const Ve
 }
 
 template<class T1, class T2>
+void FischerBurmeisterContactForceField<T1, T2>::clearReferenceDelassus()
+{
+    m_referenceDelassus.clear();
+    m_referenceDelassusLambdaIndices.clear();
+
+    d_referenceDelassus.setValue(sofa::type::vector<Real>{});
+    d_referenceDelassusLambdaIndices.setValue(sofa::type::vector<unsigned int>{});
+    d_referenceDelassusSize.setValue(sofa::Size(0));
+}
+
+template<class T1, class T2>
+void FischerBurmeisterContactForceField<T1, T2>::publishReferenceDelassus()
+{
+    d_referenceDelassus.setValue(m_referenceDelassus);
+    d_referenceDelassusSize.setValue(m_referenceDelassusLambdaIndices.size());
+
+    sofa::type::vector<unsigned int> indices;
+    indices.reserve(m_referenceDelassusLambdaIndices.size());
+
+    for (const sofa::Index index : m_referenceDelassusLambdaIndices)
+        indices.push_back(static_cast<unsigned int>(index));
+
+    d_referenceDelassusLambdaIndices.setValue(indices);
+}
+
+template<class T1, class T2>
+bool FischerBurmeisterContactForceField<T1, T2>::getReferenceTranslationalComplianceBlock(
+    sofa::Index pointI, sofa::Index pointJ, Mat3& block) const
+{
+    block.clear();
+
+    if (!m_referenceComplianceCacheValid
+        || pointI >= m_referenceCompliancePointCount
+        || pointJ >= m_referenceCompliancePointCount)
+    {
+        return false;
+    }
+
+    const std::size_t index =
+        static_cast<std::size_t>(pointI) * m_referenceCompliancePointCount
+        + static_cast<std::size_t>(pointJ);
+
+    if (index >= m_referenceTranslationalComplianceBlocks.size())
+        return false;
+
+    block = m_referenceTranslationalComplianceBlocks[index];
+    return true;
+}
+
+template<class T1, class T2>
 void FischerBurmeisterContactForceField<T1, T2>::invalidateReferenceComplianceCache()
 {
-    m_referencePointCompliance.clear();
+    m_referenceTranslationalComplianceBlocks.clear();
+    m_referenceCompliancePointCount = 0;
+    clearReferenceDelassus();
+
+    m_currentCompliance.clear();
+    m_nextCompliance.clear();
+    m_hasCurrentCompliance = false;
+    m_hasNextCompliance = false;
+
     m_cachedReferenceMetricVersion = std::numeric_limits<sofa::Size>::max();
     m_cachedConstraintSignature = 0;
     m_referenceComplianceCacheValid = false;
@@ -455,11 +519,14 @@ bool FischerBurmeisterContactForceField<T1, T2>::ensureReferenceComplianceCache(
     const sofa::Size version = beam->getReferenceElasticMetricVersion();
     const std::size_t constraintSignature = fixedConstraintSignature();
     const sofa::Size pointCount = this->mstate1->getSize();
+    const std::size_t blockCount =
+        static_cast<std::size_t>(pointCount) * static_cast<std::size_t>(pointCount);
 
     if (m_referenceComplianceCacheValid
         && m_cachedReferenceMetricVersion == version
         && m_cachedConstraintSignature == constraintSignature
-        && m_referencePointCompliance.size() == pointCount)
+        && m_referenceCompliancePointCount == pointCount
+        && m_referenceTranslationalComplianceBlocks.size() == blockCount)
     {
         return true;
     }
@@ -482,9 +549,11 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
         if (!beam || !constraint || !this->mstate1)
             return false;
 
+        invalidateReferenceComplianceCache();
+
         if (constraint->fixAllDOFs())
         {
-            msg_error() << "[NCP SCALE] All mechanical points are fixed; reference compliance is undefined.";
+            msg_error() << "[NCP SCALE] All mechanical points are fixed.";
             return false;
         }
 
@@ -508,7 +577,6 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
             constrainedPoint[point] = true;
         }
 
-        // Full scalar DoF -> reduced free DoF.
         sofa::type::vector<int> freeIndex(objectDofs, -1);
         int freeDofCount = 0;
 
@@ -530,22 +598,22 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
 
         const sofa::Size elementCount = beam->getReferenceElasticMetricElementCount();
         std::vector<Triplet> triplets;
-        triplets.reserve(static_cast<std::size_t>(elementCount) * 12u * 12u);
+        triplets.reserve(static_cast<std::size_t>(elementCount) * 144u);
 
         typename BeamForceField::StiffnessMatrix Ke;
 
-        for (sofa::Size metricElement = 0; metricElement < elementCount; ++metricElement)
+        for (sofa::Size element = 0; element < elementCount; ++element)
         {
             sofa::Index a = 0;
             sofa::Index b = 0;
 
-            if (!beam->getReferenceElasticMetricElement(metricElement, a, b, Ke))
+            if (!beam->getReferenceElasticMetricElement(element, a, b, Ke))
                 return false;
 
             if (a >= pointCount || b >= pointCount)
             {
-                msg_error() << "[NCP SCALE] Beam metric element references node outside object1: "
-                            << a << ", " << b << " pointCount=" << pointCount;
+                msg_error() << "[NCP SCALE] Beam metric element references invalid node "
+                            << a << "," << b << " pointCount=" << pointCount;
                 return false;
             }
 
@@ -569,10 +637,7 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
                     if (reducedCol < 0)
                         continue;
 
-                    // K0 is symmetric; averaging removes only round-off asymmetry
-                    // introduced by the block rotations.
                     const Real value = Real(0.5) * (Ke(row, col) + Ke(col, row));
-
                     if (value != Real(0))
                         triplets.emplace_back(reducedRow, reducedCol, value);
                 }
@@ -595,7 +660,6 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
         }
 
         const auto D = factorization.vectorD();
-
         Real minD = std::numeric_limits<Real>::infinity();
         Real maxD = Real(0);
 
@@ -605,8 +669,8 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
 
             if (!std::isfinite(static_cast<double>(value)) || value <= Real(0))
             {
-                msg_error() << "[NCP SCALE] Reference elastic metric is not positive definite. "
-                            << "D[" << i << "]=" << value;
+                msg_error() << "[NCP SCALE] Reference elastic metric is not positive definite."
+                            << " D[" << i << "]=" << value;
                 return false;
             }
 
@@ -614,8 +678,6 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
             maxD = std::max(maxD, value);
         }
 
-        // Build all translational unit loads once. The resulting 3x3 diagonal
-        // inverse block at each point is enough for every future H C_i H^T.
         sofa::type::vector<int> basisColumn(pointCount * TranslationalDim, -1);
         int basisCount = 0;
 
@@ -623,9 +685,7 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
         {
             for (sofa::Size d = 0; d < TranslationalDim; ++d)
             {
-                const int reduced = freeIndex[point * DerivDim1 + d];
-
-                if (reduced >= 0)
+                if (freeIndex[point * DerivDim1 + d] >= 0)
                     basisColumn[point * TranslationalDim + d] = basisCount++;
             }
         }
@@ -653,63 +713,66 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
             return false;
         }
 
-        sofa::type::vector<Mat3> pointCompliance(pointCount);
+        const std::size_t blockCount =
+            static_cast<std::size_t>(pointCount) * static_cast<std::size_t>(pointCount);
 
-        for (sofa::Index point = 0; point < pointCount; ++point)
+        sofa::type::vector<Mat3> blocks(blockCount);
+
+        // K_ref is SPD, hence Ctt_ji = Ctt_ij^T. Extract only one triangular
+        // half from the multi-RHS solve and mirror it exactly.
+        for (sofa::Index pointI = 0; pointI < pointCount; ++pointI)
         {
-            Mat3 C;
-            C.clear();
-
-            for (sofa::Size row = 0; row < TranslationalDim; ++row)
+            for (sofa::Index pointJ = pointI; pointJ < pointCount; ++pointJ)
             {
-                const int reducedRow = freeIndex[point * DerivDim1 + row];
+                Mat3& Cij = blocks[
+                    static_cast<std::size_t>(pointI) * pointCount
+                    + static_cast<std::size_t>(pointJ)];
+                Cij.clear();
 
-                if (reducedRow < 0)
-                    continue;
-
-                for (sofa::Size col = 0; col < TranslationalDim; ++col)
+                for (sofa::Size row = 0; row < TranslationalDim; ++row)
                 {
-                    const int column = basisColumn[point * TranslationalDim + col];
+                    const int reducedRow = freeIndex[pointI * DerivDim1 + row];
+                    if (reducedRow < 0)
+                        continue;
 
-                    if (column >= 0)
-                        C(row, col) = response(reducedRow, column);
+                    for (sofa::Size col = 0; col < TranslationalDim; ++col)
+                    {
+                        const int column = basisColumn[pointJ * TranslationalDim + col];
+                        if (column >= 0)
+                            Cij(row, col) = response(reducedRow, column);
+                    }
+                }
+
+                Mat3& Cji = blocks[
+                    static_cast<std::size_t>(pointJ) * pointCount
+                    + static_cast<std::size_t>(pointI)];
+
+                if (pointI == pointJ)
+                {
+                    for (sofa::Size row = 0; row < TranslationalDim; ++row)
+                    {
+                        for (sofa::Size col = row + 1; col < TranslationalDim; ++col)
+                        {
+                            const Real value = Real(0.5) * (Cij(row, col) + Cij(col, row));
+                            Cij(row, col) = value;
+                            Cij(col, row) = value;
+                        }
+                    }
+                }
+                else
+                {
+                    for (sofa::Size row = 0; row < TranslationalDim; ++row)
+                        for (sofa::Size col = 0; col < TranslationalDim; ++col)
+                            Cji(col, row) = Cij(row, col);
                 }
             }
-
-            // Preserve a symmetric positive metric despite solve round-off.
-            for (sofa::Size row = 0; row < TranslationalDim; ++row)
-            {
-                for (sofa::Size col = row + 1; col < TranslationalDim; ++col)
-                {
-                    const Real average = Real(0.5) * (C(row, col) + C(col, row));
-                    C(row, col) = average;
-                    C(col, row) = average;
-                }
-            }
-
-            pointCompliance[point] = C;
         }
 
-        m_referencePointCompliance = std::move(pointCompliance);
+        m_referenceTranslationalComplianceBlocks = std::move(blocks);
+        m_referenceCompliancePointCount = pointCount;
         m_cachedReferenceMetricVersion = beam->getReferenceElasticMetricVersion();
         m_cachedConstraintSignature = fixedConstraintSignature();
         m_referenceComplianceCacheValid = true;
-
-        // Values computed from an older metric must never survive a rebuild.
-        m_currentCompliance.clear();
-        m_nextCompliance.clear();
-        m_hasCurrentCompliance = false;
-        m_hasNextCompliance = false;
-
-        if (d_debug.getValue())
-        {
-            msg_info() << "[NCP SCALE CACHE] elements=" << elementCount
-                       << " points=" << pointCount
-                       << " freeDofs=" << freeDofCount
-                       << " translationalRhs=" << basisCount
-                       << " LDLT_D[min/max]=" << minD << "/" << maxD
-                       << " metricVersion=" << m_cachedReferenceMetricVersion;
-        }
 
         return true;
     }
@@ -717,15 +780,20 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
 
 template<class T1, class T2>
 bool FischerBurmeisterContactForceField<T1, T2>::computeLaggedComplianceFromCurrentContacts(
-    sofa::type::vector<Real>& candidate) const
+    sofa::type::vector<Real>& candidate)
 {
     if (!m_referenceComplianceCacheValid || !this->mstate1)
         return false;
 
     const sofa::Size pointCount = this->mstate1->getSize();
+    const std::size_t blockCount =
+        static_cast<std::size_t>(pointCount) * static_cast<std::size_t>(pointCount);
 
-    if (m_referencePointCompliance.size() != pointCount)
+    if (m_referenceCompliancePointCount != pointCount
+        || m_referenceTranslationalComplianceBlocks.size() != blockCount)
+    {
         return false;
+    }
 
     const Real fallback = d_fixedComplianceScale.getValue();
 
@@ -734,57 +802,97 @@ bool FischerBurmeisterContactForceField<T1, T2>::computeLaggedComplianceFromCurr
     else
         candidate.assign(pointCount, fallback);
 
+    sofa::type::vector<sofa::Index> active;
+    active.reserve(m_contacts.size());
+
+    for (sofa::Index i = 0; i < m_contacts.size(); ++i)
+    {
+        if (m_contacts[i].status == ContactStatus::Active)
+            active.push_back(i);
+    }
+
+    const sofa::Size activeCount = active.size();
+    m_referenceDelassus.assign(
+        static_cast<std::size_t>(activeCount) * static_cast<std::size_t>(activeCount),
+        Real(0));
+    m_referenceDelassusLambdaIndices.resize(activeCount);
+
+    for (sofa::Size i = 0; i < activeCount; ++i)
+        m_referenceDelassusLambdaIndices[i] = m_contacts[active[i]].lambdaIndex;
+
     Real minR = std::numeric_limits<Real>::infinity();
     Real maxR = Real(0);
     Real sumR = Real(0);
-    sofa::Size activeCount = 0;
+    sofa::Size validScaleCount = 0;
 
-    for (const Contact& c : m_contacts)
+    for (sofa::Size row = 0; row < activeCount; ++row)
     {
-        if (c.status != ContactStatus::Active)
-            continue;
+        const Contact& ci = m_contacts[active[row]];
 
-        if (c.pointIndex >= m_referencePointCompliance.size())
+        if (ci.pointIndex >= pointCount)
+        {
+            clearReferenceDelassus();
             return false;
-
-        const Mat3& C = m_referencePointCompliance[c.pointIndex];
-        Vec3 Ch;
-        Ch.clear();
-
-        for (sofa::Size row = 0; row < TranslationalDim; ++row)
-            for (sofa::Size col = 0; col < TranslationalDim; ++col)
-                Ch[row] += C(row, col) * c.gapGradient[col];
-
-        const Real r = c.gapGradient * Ch;
-
-        if (!std::isfinite(static_cast<double>(r)) || r <= Real(0))
-        {
-            msg_info() << "[NCP SCALE] Non-positive reference compliance at point="
-                          << c.pointIndex << " r=" << r
-                          << ". Keeping the previous/fixed scale for the next solve.";
-            continue;
         }
 
-        candidate[c.pointIndex] = r;
-        minR = std::min(minR, r);
-        maxR = std::max(maxR, r);
-        sumR += r;
-        ++activeCount;
+        for (sofa::Size col = row; col < activeCount; ++col)
+        {
+            const Contact& cj = m_contacts[active[col]];
+
+            if (cj.pointIndex >= pointCount)
+            {
+                clearReferenceDelassus();
+                return false;
+            }
+
+            const Mat3& Cij =
+                m_referenceTranslationalComplianceBlocks[
+                    static_cast<std::size_t>(ci.pointIndex) * pointCount
+                    + static_cast<std::size_t>(cj.pointIndex)];
+
+            Vec3 CijHj;
+            CijHj.clear();
+
+            for (sofa::Size i = 0; i < TranslationalDim; ++i)
+                for (sofa::Size j = 0; j < TranslationalDim; ++j)
+                    CijHj[i] += Cij(i, j) * cj.gapGradient[j];
+
+            const Real wij = ci.gapGradient * CijHj;
+
+            if (!std::isfinite(static_cast<double>(wij)))
+            {
+                msg_warning() << "[NCP DELASSUS] Non-finite entry"
+                              << " lambdaI=" << ci.lambdaIndex
+                              << " lambdaJ=" << cj.lambdaIndex;
+                clearReferenceDelassus();
+                return false;
+            }
+
+            m_referenceDelassus[static_cast<std::size_t>(row) * activeCount + col] = wij;
+            m_referenceDelassus[static_cast<std::size_t>(col) * activeCount + row] = wij;
+        }
+
+        // Real rowNorm2 = Real(0);
+
+        // for (sofa::Size col = 0; col < activeCount; ++col)
+        // {
+        //     const Real wij =m_referenceDelassus[static_cast<std::size_t>(row) * activeCount + col];
+        //     rowNorm2 += wij * wij;
+        // }
+
+        const Real r = m_referenceDelassus[static_cast<std::size_t>(row) * activeCount + row];
+
+        if (std::isfinite(static_cast<double>(r)) && r > Real(0))
+        {
+            candidate[ci.pointIndex] = r;
+            minR = std::min(minR, r);
+            maxR = std::max(maxR, r);
+            sumR += r;
+            ++validScaleCount;
+        }
     }
 
-    if (d_debug.getValue())
-    {
-        if (activeCount > 0)
-        {
-            msg_info() << "[NCP SCALE COMPUTE] active=" << activeCount
-                       << " r[min/mean/max]=" << minR << "/"
-                       << (sumR / static_cast<Real>(activeCount)) << "/" << maxR;
-        }
-        else
-        {
-            msg_info() << "[NCP SCALE COMPUTE] active=0";
-        }
-    }
+    publishReferenceDelassus();
 
     return true;
 }
@@ -805,10 +913,6 @@ bool FischerBurmeisterContactForceField<T1, T2>::commitLaggedComplianceSnapshot(
 
     m_nextCompliance = std::move(candidate);
     m_hasNextCompliance = true;
-
-    if (d_debug.getValue())
-        msg_info() << "[NCP SCALE COMMIT] points=" << m_nextCompliance.size()
-                   << " targetGeneration=" << (m_complianceGeneration + 1);
 
     return true;
 }
@@ -925,6 +1029,121 @@ void FischerBurmeisterContactForceField<T1, T2>::logFiniteDifferenceTrial(Real a
 
     const Real eps = Real(1e-14);
 
+    // Diagnostic thresholds. Keep these hard-coded while the diagnostics are
+    // being tuned; they can become Data<> fields once the useful ranges settle.
+    const Real normalAngleTolDeg = Real(2);
+    const Real gradientChangeTol = Real(0.05);
+    const Real dgAbsTol = Real(1e-6);
+    const Real dgRelTol = Real(0.01);
+    const Real dHAbsTol = Real(1e-5);
+    const Real dHRelTol = Real(0.05);
+    const Real dForceAbsTol = Real(1e-4);
+    const Real dForceRelTol = Real(0.01);
+    const Real dPhiAbsTol = Real(1e-6);
+    const Real dPhiRelTol = Real(0.01);
+    const Real complianceFreezeTol = Real(1e-12);
+
+    auto scalarScore = [eps](Real fd, Real jac, Real absTol, Real relTol)
+    {
+        const Real error = std::abs(fd - jac);
+        const Real scale = std::max(std::abs(fd), std::abs(jac));
+        const Real allowed = std::max(absTol, relTol * scale);
+        return error / std::max(allowed, eps);
+    };
+
+    auto vectorScore = [eps](const Vec3& fd, const Vec3& jac, Real absTol, Real relTol)
+    {
+        Vec3 error;
+        error.clear();
+        for (sofa::Size d = 0; d < TranslationalDim; ++d)
+            error[d] = fd[d] - jac[d];
+
+        const Real errorNorm = std::sqrt(error.norm2());
+        const Real fdNorm = std::sqrt(fd.norm2());
+        const Real jacNorm = std::sqrt(jac.norm2());
+        const Real allowed = std::max(absTol, relTol * std::max(fdNorm, jacNorm));
+        return errorNorm / std::max(allowed, eps);
+    };
+
+    auto relativeScalarError = [eps](Real fd, Real jac)
+    {
+        return std::abs(fd - jac) / std::max(std::max(std::abs(fd), std::abs(jac)), eps);
+    };
+
+    auto relativeVectorError = [eps](const Vec3& fd, const Vec3& jac)
+    {
+        Vec3 error;
+        error.clear();
+        for (sofa::Size d = 0; d < TranslationalDim; ++d)
+            error[d] = fd[d] - jac[d];
+
+        const Real errorNorm = std::sqrt(error.norm2());
+        const Real fdNorm = std::sqrt(fd.norm2());
+        const Real jacNorm = std::sqrt(jac.norm2());
+        return errorNorm / std::max(std::max(fdNorm, jacNorm), eps);
+    };
+
+    struct WorstContact
+    {
+        bool valid = false;
+        sofa::Index point = 0;
+        std::string flags;
+        Real score = Real(0);
+        Real g = Real(0);
+        Real lambda = Real(0);
+        Real phi = Real(0);
+        Real angleDeg = Real(0);
+        Real dgRelErr = Real(0);
+        Real dHRelErr = Real(0);
+        Real dFRelErr = Real(0);
+        Real dPhiRelErr = Real(0);
+        Real dr = Real(0);
+        Real gradNorm = Real(0);
+        Real hessGradNorm = Real(0);
+        Real gapHessFrob = Real(0);
+        Real lambdaHessFrob = Real(0);
+        bool hasHessian = false;
+        bool dForceOutlier = false;
+        Vec3 dForceFD;
+        Vec3 dForceJ;
+        Vec3 lambdaPart;
+        Vec3 hessianPart;
+        Vec3 dHfd;
+        Vec3 dHj;
+    };
+
+    WorstContact worst;
+
+    sofa::Size activeCount = 0;
+    sofa::Size hessianCount = 0;
+    sofa::Size outlierCount = 0;
+    sofa::Size statusChangeCount = 0;
+
+    bool hasFirstStatusChange = false;
+    sofa::Index firstStatusPoint = 0;
+    unsigned int firstBaseStatus = 0;
+    unsigned int firstTrialStatus = 0;
+
+    Real minimumGradientNorm = std::numeric_limits<Real>::infinity();
+    Real maximumGradientNorm = Real(0);
+    Real maximumGradientNormError = Real(0);
+    sofa::Index maximumGradientNormErrorPoint = 0;
+
+    Real maximumHessianFrob = Real(0);
+    sofa::Index maximumHessianFrobPoint = 0;
+
+    Real maximumHessianGradientNorm = Real(0);
+    sofa::Index maximumHessianGradientPoint = 0;
+
+    Real maximumEikonalRelativeDefect = Real(0);
+    sofa::Index maximumEikonalRelativeDefectPoint = 0;
+
+    Real maximumGapHessianFrob = Real(0);
+    sofa::Index maximumGapHessianPoint = 0;
+
+    Real maximumLambdaHessianFrob = Real(0);
+    sofa::Index maximumLambdaHessianPoint = 0;
+
     for (sofa::Index i = 0; i < m_contacts.size(); ++i)
     {
         const auto& snapshot = m_fdBaseContacts[i];
@@ -933,22 +1152,36 @@ void FischerBurmeisterContactForceField<T1, T2>::logFiniteDifferenceTrial(Real a
 
         if (base.status != trial.status)
         {
-            msg_info() << "[NCP FD CONTACT] point=" << i
-                       << " alpha=" << alpha
-                       << " status=" << static_cast<unsigned int>(base.status)
-                       << "->" << static_cast<unsigned int>(trial.status);
+            ++statusChangeCount;
+            if (!hasFirstStatusChange)
+            {
+                hasFirstStatusChange = true;
+                firstStatusPoint = i;
+                firstBaseStatus = static_cast<unsigned int>(base.status);
+                firstTrialStatus = static_cast<unsigned int>(trial.status);
+            }
             continue;
         }
 
         if (base.status != ContactStatus::Active)
             continue;
 
+        ++activeCount;
+
         const Real H0Norm = std::sqrt(base.gapGradient.norm2());
         const Real H1Norm = std::sqrt(trial.gapGradient.norm2());
+        minimumGradientNorm = std::min(minimumGradientNorm, H0Norm);
+        maximumGradientNorm = std::max(maximumGradientNorm, H0Norm);
+
+        const Real gradientNormError = std::abs(H0Norm - Real(1));
+        if (gradientNormError > maximumGradientNormError)
+        {
+            maximumGradientNormError = gradientNormError;
+            maximumGradientNormErrorPoint = i;
+        }
 
         Vec3 deltaH;
         deltaH.clear();
-
         Real Hdot = Real(0);
 
         for (sofa::Size d = 0; d < TranslationalDim; ++d)
@@ -958,60 +1191,26 @@ void FischerBurmeisterContactForceField<T1, T2>::logFiniteDifferenceTrial(Real a
         }
 
         const Real deltaHNorm = std::sqrt(deltaH.norm2());
-
-        const Real gradientRelativeChange =
-            deltaHNorm / std::max(H0Norm, eps);
+        const Real gradientRelativeChange = deltaHNorm / std::max(H0Norm, eps);
 
         Real normalCosine = Real(1);
-
         if (H0Norm > eps && H1Norm > eps)
         {
             normalCosine = Hdot / (H0Norm * H1Norm);
             normalCosine = std::max(Real(-1), std::min(Real(1), normalCosine));
         }
 
-        const Real normalAngleDeg =
-            std::acos(normalCosine) * Real(57.29577951308232);
-
-        // Norm of the spatial part a*H of the FB row.
-        const Real spatialRowNorm0 =
-            std::abs(base.dPhiDgap) * H0Norm;
-
-        const Real spatialRowNorm1 =
-            std::abs(trial.dPhiDgap) * H1Norm;
-
-        // Full FB row norm:
-        //     [ dPhi/dg * H , dPhi/dlambda ]
-        const Real fbRowNorm0 = std::sqrt(
-            spatialRowNorm0 * spatialRowNorm0
-            + base.dPhiDlambda * base.dPhiDlambda);
-
-        const Real fbRowNorm1 = std::sqrt(
-            spatialRowNorm1 * spatialRowNorm1
-            + trial.dPhiDlambda * trial.dPhiDlambda);
-
-        msg_info() << "[NCP H CONTINUITY]"
-                << " point=" << i
-                << " alpha=" << alpha
-                << " H0=" << base.gapGradient
-                << " H1=" << trial.gapGradient
-                << " |H0|=" << H0Norm
-                << " |H1|=" << H1Norm
-                << " |dH|=" << deltaHNorm
-                << " relDH=" << gradientRelativeChange
-                << " angleDeg=" << normalAngleDeg
-                << " a0=" << base.dPhiDgap
-                << " a1=" << trial.dPhiDgap
-                << " b0=" << base.dPhiDlambda
-                << " b1=" << trial.dPhiDlambda
-                << " |aH0|=" << spatialRowNorm0
-                << " |aH1|=" << spatialRowNorm1
-                << " |FBrow0|=" << fbRowNorm0
-                << " |FBrow1|=" << fbRowNorm1;
-
+        const Real normalAngleDeg = std::acos(normalCosine) * Real(57.29577951308232);
         const Vec3 trialPosition = extractPosition(x1[i]);
+
         Vec3 dx, dHfd, dHj, forceBase, forceTrial, dForceFD, dForceJ;
-        dx.clear(); dHfd.clear(); dHj.clear(); forceBase.clear(); forceTrial.clear(); dForceFD.clear(); dForceJ.clear();
+        dx.clear();
+        dHfd.clear();
+        dHj.clear();
+        forceBase.clear();
+        forceTrial.clear();
+        dForceFD.clear();
+        dForceJ.clear();
 
         Real dgJ = Real(0);
         for (sofa::Size d = 0; d < TranslationalDim; ++d)
@@ -1026,62 +1225,210 @@ void FischerBurmeisterContactForceField<T1, T2>::logFiniteDifferenceTrial(Real a
 
         const Real dgFD = (trial.gap - base.gap) / alpha;
         const Real dLambda = (trial.lambda - base.lambda) / alpha;
-        const Real dr = (trial.complianceScale - base.complianceScale) / alpha;
+        const Real deltaCompliance = trial.complianceScale - base.complianceScale;
+        const Real dr = deltaCompliance / alpha;
 
         Mat3 hessian;
         const bool hasHessian = computeGapHessian(snapshot.position, hessian);
+
+        Real hessianFrob = Real(0);
+        Real hessianGradientNorm = Real(0);
+        Real gapHessianFrob = Real(0);
+        Real lambdaHessianFrob = Real(0);
+
         if (hasHessian)
         {
-            for (sofa::Size row = 0; row < TranslationalDim; ++row)
-                for (sofa::Size col = 0; col < TranslationalDim; ++col)
-                    dHj[row] += hessian(row, col) * dx[col];
-        }
+            ++hessianCount;
+            Real hessianFrob2 = Real(0);
+            Vec3 hessianGradient;
+            hessianGradient.clear();
 
-        for (sofa::Size d = 0; d < TranslationalDim; ++d)
-            dForceJ[d] = base.gapGradient[d] * dLambda + base.lambda * dHj[d];
+            for (sofa::Size row = 0; row < TranslationalDim; ++row)
+            {
+                for (sofa::Size col = 0; col < TranslationalDim; ++col)
+                {
+                    const Real value = hessian(row, col);
+                    hessianFrob2 += value * value;
+                    dHj[row] += value * dx[col];
+                    hessianGradient[row] += value * base.gapGradient[col];
+                }
+            }
+
+            hessianFrob = std::sqrt(hessianFrob2);
+            hessianGradientNorm = std::sqrt(hessianGradient.norm2());
+            const Real eikonalRelativeDefect = hessianGradientNorm / std::max(hessianFrob * H0Norm, eps);
+            gapHessianFrob = std::abs(base.gap) * hessianFrob;
+            lambdaHessianFrob = std::abs(base.lambda) * hessianFrob;
+
+            if (hessianFrob > maximumHessianFrob)
+            {
+                maximumHessianFrob = hessianFrob;
+                maximumHessianFrobPoint = i;
+            }
+
+            if (hessianGradientNorm > maximumHessianGradientNorm)
+            {
+                maximumHessianGradientNorm = hessianGradientNorm;
+                maximumHessianGradientPoint = i;
+            }
+
+            if (eikonalRelativeDefect > maximumEikonalRelativeDefect)
+            {
+                maximumEikonalRelativeDefect = eikonalRelativeDefect;
+                maximumEikonalRelativeDefectPoint = i;
+            }
+
+            if (gapHessianFrob > maximumGapHessianFrob)
+            {
+                maximumGapHessianFrob = gapHessianFrob;
+                maximumGapHessianPoint = i;
+            }
+
+            if (lambdaHessianFrob > maximumLambdaHessianFrob)
+            {
+                maximumLambdaHessianFrob = lambdaHessianFrob;
+                maximumLambdaHessianPoint = i;
+            }
+        }
 
         const Real dPhiFD = (trial.phi - base.phi) / alpha;
         const Real dPhiJ = base.dPhiDgap * dgJ + base.dPhiDlambda * dLambda;
-        Real dPhiJWithDr = dPhiJ;
-        if (std::abs(base.complianceScale) > eps)
-            dPhiJWithDr += (base.dPhiDlambda / base.complianceScale) * base.lambda * dr;
 
-        if (std::abs(dPhiFD -dPhiJ) > 1.0)
+        Vec3 lambdaPart;
+        Vec3 hessianPart;
+        lambdaPart.clear();
+        hessianPart.clear();
+
+        for (sofa::Size d = 0; d < TranslationalDim; ++d)
         {
-            msg_info() << "[NCP FD CONTACT] point=" << i
-                    << " alpha=" << alpha
-                    << " g0=" << base.gap
-                    << " g1=" << trial.gap
-                    << " lambda0=" << base.lambda
-                    << " lambda1=" << trial.lambda
-                    << " dLambda=" << dLambda
-                    << " s0=" << base.complianceScale * base.lambda
-                    << " s1=" << trial.complianceScale * trial.lambda
-                    << " phi0=" << base.phi
-                    << " phi1=" << trial.phi
-                    << " dPhiDg=" << base.dPhiDgap
-                    << " dPhiDl=" << base.dPhiDlambda
-                    << " dPhiFD=" << dPhiFD
-                    << " dPhiJ=" << dPhiJ
-                    << " dr=" << dr;
+            lambdaPart[d] = base.gapGradient[d] * dLambda;
+            hessianPart[d] = base.lambda * dHj[d];
+            dForceJ[d] = lambdaPart[d] + hessianPart[d];
         }
 
-        msg_info() << "[NCP FD CONTACT] point=" << i
-                   << " alpha=" << alpha
-                   << " dgFD=" << dgFD
-                   << " Hdx=" << dgJ
-                   << " dgErr=" << (dgFD - dgJ)
-                   << " dHFD=" << dHfd
-                   << " HessDx=" << dHj
-                   << " dHErr=" << (dHfd - dHj)
-                   << " dFfd=" << dForceFD
-                   << " dFJ=" << dForceJ
-                   << " dFErr=" << (dForceFD - dForceJ)
-                   << " dPhiFD=" << dPhiFD
-                   << " dPhiJ=" << dPhiJ
-                   << " dPhiJ+dr=" << dPhiJWithDr
-                   << " dr=" << dr
-                   << " Hessian=" << hasHessian;
+        const Real hScore = std::max(
+            normalAngleDeg / std::max(normalAngleTolDeg, eps),
+            gradientRelativeChange / std::max(gradientChangeTol, eps));
+        const Real dgScore = scalarScore(dgFD, dgJ, dgAbsTol, dgRelTol);
+        const Real dHScore = hasHessian ? vectorScore(dHfd, dHj, dHAbsTol, dHRelTol) : Real(0);
+        const Real dForceScore = vectorScore(dForceFD, dForceJ, dForceAbsTol, dForceRelTol);
+        const Real dPhiScore = scalarScore(dPhiFD, dPhiJ, dPhiAbsTol, dPhiRelTol);
+        const Real complianceScore = std::abs(deltaCompliance) / std::max(complianceFreezeTol, eps);
+
+        const bool hOutlier = hScore > Real(1);
+        const bool dgOutlier = dgScore > Real(1);
+        const bool dHOutlier = hasHessian && dHScore > Real(1);
+        const bool dForceOutlier = dForceScore > Real(1);
+        const bool dPhiOutlier = dPhiScore > Real(1);
+        const bool complianceChanged = complianceScore > Real(1);
+
+        if (!(hOutlier || dgOutlier || dHOutlier || dForceOutlier || dPhiOutlier || complianceChanged))
+            continue;
+
+        ++outlierCount;
+
+        const Real score = std::max({hScore, dgScore, dHScore, dForceScore, dPhiScore, complianceScore});
+        if (worst.valid && score <= worst.score)
+            continue;
+
+        std::ostringstream flags;
+        if (hOutlier) flags << "H|";
+        if (dgOutlier) flags << "DG|";
+        if (dHOutlier) flags << "DH|";
+        if (dForceOutlier) flags << "DF|";
+        if (dPhiOutlier) flags << "DPHI|";
+        if (complianceChanged) flags << "R|";
+
+        std::string flagString = flags.str();
+        if (!flagString.empty())
+            flagString.pop_back();
+
+        worst.valid = true;
+        worst.point = i;
+        worst.flags = std::move(flagString);
+        worst.score = score;
+        worst.g = base.gap;
+        worst.lambda = base.lambda;
+        worst.phi = base.phi;
+        worst.angleDeg = normalAngleDeg;
+        worst.dgRelErr = relativeScalarError(dgFD, dgJ);
+        worst.dHRelErr = hasHessian ? relativeVectorError(dHfd, dHj) : Real(0);
+        worst.dFRelErr = relativeVectorError(dForceFD, dForceJ);
+        worst.dPhiRelErr = relativeScalarError(dPhiFD, dPhiJ);
+        worst.dr = dr;
+        worst.gradNorm = H0Norm;
+        worst.hessGradNorm = hessianGradientNorm;
+        worst.gapHessFrob = gapHessianFrob;
+        worst.lambdaHessFrob = lambdaHessianFrob;
+        worst.hasHessian = hasHessian;
+        worst.dForceOutlier = dForceOutlier;
+        worst.dForceFD = dForceFD;
+        worst.dForceJ = dForceJ;
+        worst.lambdaPart = lambdaPart;
+        worst.hessianPart = hessianPart;
+        worst.dHfd = dHfd;
+        worst.dHj = dHj;
+    }
+
+    if (activeCount > 0)
+    {
+        msg_warning() << "[NCP SDF QUALITY]"
+                      << " alpha=" << alpha
+                      << " active=" << activeCount
+                      << " hessian=" << hessianCount
+                      << " |grad|=[" << minimumGradientNorm << "," << maximumGradientNorm << "]"
+                      << " maxGradErr=" << maximumGradientNormError << "@" << maximumGradientNormErrorPoint
+                      << " max|Hess|F=" << maximumHessianFrob << "@" << maximumHessianFrobPoint
+                      << " max|Hess*grad|=" << maximumHessianGradientNorm << "@" << maximumHessianGradientPoint
+                      << " maxEikonalRel=" << maximumEikonalRelativeDefect << "@" << maximumEikonalRelativeDefectPoint
+                      << " max|g*Hess|F=" << maximumGapHessianFrob << "@" << maximumGapHessianPoint
+                      << " max|lambda*Hess|F=" << maximumLambdaHessianFrob << "@" << maximumLambdaHessianPoint;
+    }
+
+    if (statusChangeCount > 0)
+    {
+        msg_warning() << "[NCP FD CONTACT STATUS]"
+                      << " alpha=" << alpha
+                      << " count=" << statusChangeCount
+                      << " firstPoint=" << firstStatusPoint
+                      << " first=" << firstBaseStatus << "->" << firstTrialStatus;
+    }
+
+    if (!worst.valid)
+        return;
+
+    const Real decades = std::log10(std::max(worst.score, Real(1)));
+    msg_warning() << "[NCP FD CONTACT WORST]"
+                  << " outliers=" << outlierCount
+                  << " p=" << worst.point
+                  << " flags=" << worst.flags
+                  << " score=" << worst.score
+                  << " decades=" << decades
+                  << " g=" << worst.g
+                  << " lambda=" << worst.lambda
+                  << " phi=" << worst.phi
+                  << " |grad|=" << worst.gradNorm
+                  << " angle=" << worst.angleDeg
+                  << " dgRel=" << worst.dgRelErr
+                  << " dHRel=" << worst.dHRelErr
+                  << " dFRel=" << worst.dFRelErr
+                  << " dPhiRel=" << worst.dPhiRelErr
+                  << " dr=" << worst.dr
+                  << " |Hess*grad|=" << worst.hessGradNorm
+                  << " |g*Hess|F=" << worst.gapHessFrob
+                  << " |lambda*Hess|F=" << worst.lambdaHessFrob
+                  << " Hess=" << worst.hasHessian;
+
+    if (worst.dForceOutlier)
+    {
+        msg_warning() << "[NCP FD CONTACT DF]"
+                      << " p=" << worst.point
+                      << " |dFfd|=" << std::sqrt(worst.dForceFD.norm2())
+                      << " |dFJ|=" << std::sqrt(worst.dForceJ.norm2())
+                      << " |H*dLambda|=" << std::sqrt(worst.lambdaPart.norm2())
+                      << " |lambda*HessDx|=" << std::sqrt(worst.hessianPart.norm2())
+                      << " |dHfd|=" << std::sqrt(worst.dHfd.norm2())
+                      << " |HessDx|=" << std::sqrt(worst.dHj.norm2());
     }
 }
 
@@ -1275,9 +1622,7 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
 
             // Optional J_xx = lambda Hess(g).
             Mat3 gapHessian;
-            if (c.lambda != Real(0)
-                && c.pointIndex < x1.size()
-                && computeGapHessian(extractPosition(x1[c.pointIndex]), gapHessian))
+            if (c.lambda != Real(0) && c.pointIndex < x1.size() && computeGapHessian(extractPosition(x1[c.pointIndex]), gapHessian))
             {
                 for (sofa::Size row = 0; row < TranslationalDim; ++row)
                     for (sofa::Size col = 0; col < TranslationalDim; ++col)
@@ -1287,7 +1632,10 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
 
         // Active row: dphi/dlambda = b.
         // Pinned/invalid row: finalizeContactRow() sets b=1 and H=0, yielding the simple equation lambda=0.
-        lowerRight(0, 0) = c.dPhiDlambda + 1e-6;
+        lowerRight(0, 0) = c.dPhiDlambda;
+
+        if (c.status == ContactStatus::Active)
+            lowerRight(0, 0) += d_contactNewtonRegularization.getValue();
 
         dRx_dX(
             DerivDim1 * c.pointIndex,

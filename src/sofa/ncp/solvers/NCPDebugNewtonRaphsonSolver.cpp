@@ -278,7 +278,7 @@ void NCPDebugNewtonRaphsonSolver::solveNCP(BaseNonLinearFunction& function)
 
             if (usingLM)
             {
-                currentMu = lmInitialDamping * std::pow(10_sreal, static_cast<SReal>(lmAttempt));
+                currentMu = lmInitialDamping / std::pow(10_sreal, static_cast<SReal>(lmAttempt));
                 ++lmAttempt;
 
                 const char* trigger = startWithLM ? "stagnation" : "line-search";

@@ -34,9 +34,9 @@ NCPDebugNewtonRaphsonSolver::NCPDebugNewtonRaphsonSolver()
         "nonMonotoneWindow", "Number of recent accepted merit values used by the non-monotone Armijo condition."))
     , d_enableLMFallback(initData(&d_enableLMFallback, false,
         "enableLMFallback", "Use one-shot LM rescue steps after Newton line-search failure or repeated tiny accepted Newton steps."))
-    , d_lmInitialDamping(initData(&d_lmInitialDamping, 1e-4_sreal,
+    , d_lmInitialDamping(initData(&d_lmInitialDamping, 1e-6_sreal,
         "lmInitialDamping", "Initial multiplier-only LM damping."))
-    , d_lmMaxRetries(initData(&d_lmMaxRetries, 3u,
+    , d_lmMaxRetries(initData(&d_lmMaxRetries, 6u,
         "lmMaxRetries", "Maximum LM damping attempts at the same Newton base."))
     , d_lmStagnationIterations(initData(&d_lmStagnationIterations, 2u,
         "lmStagnationIterations", "Consecutive tiny/ineffective accepted Newton steps before one LM rescue step."))

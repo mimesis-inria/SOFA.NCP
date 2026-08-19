@@ -75,7 +75,7 @@ namespace sofa::ncp
         registerPlaneNCPContactForceField(factory);
         registerCylinderNCPContactForceField(factory);
         registerSignedDistanceFieldNCPContactForceField(factory);
-        registerMeshNCPContactForceField(factory);
+        // registerMeshNCPContactForceField(factory);
     }
 
 }

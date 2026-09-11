@@ -3,7 +3,7 @@
 *
 * Residual:
 *     R_x      += H^T lambda
-*     R_lambda += phi(g, r lambda)
+*     R_lambda += phi(g, r lambda) / r
 *
 * Contact Jacobian with r frozen:
 *
@@ -13,8 +13,8 @@
 *
 * Lagged scaling uses a positive reference beam metric:
 *
-*     C_ref = K_ref^{-1}
-*     W_ref = H C_ref H^T
+*     C_ref = J0 P K_ref,f^{-1} P^T J0^T
+*     W_ref = N C_ref N^T
 *     r_i   = (W_ref)_ii
 *
 * lambda remains scalar per frictionless normal constraint. W_ref is retained
@@ -27,6 +27,7 @@
 #include <sofa/component/constraint/projective/FixedProjectiveConstraint.h>
 #include <sofa/component/solidmechanics/fem/elastic/BeamFEMForceField.h>
 #include <sofa/core/behavior/MechanicalState.h>
+#include <sofa/core/Mapping.h>
 #include <sofa/core/behavior/MixedInteractionForceField.h>
 #include <sofa/core/objectmodel/Data.h>
 #include <sofa/defaulttype/RigidTypes.h>
@@ -98,8 +99,10 @@ public:
     using DataVecDeriv2 = core::objectmodel::Data<VecDeriv2>;
     using Contact = ContactRow<DataTypes1, DataTypes2>;
     using ContactStatus = ContactRowStatus;
-    using FixedConstraint = sofa::component::constraint::projective::FixedProjectiveConstraint<DataTypes1>;
+    using FixedConstraint = sofa::component::constraint::projective::FixedProjectiveConstraint<sofa::defaulttype::Rigid3Types>;
     using BeamForceField = sofa::component::solidmechanics::fem::elastic::BeamFEMForceField<sofa::defaulttype::Rigid3Types>;
+
+    using ContactMapping = sofa::core::Mapping<sofa::defaulttype::Rigid3Types, sofa::defaulttype::Vec3Types>;
 
     struct ResidualBlockNorms
     {
@@ -135,6 +138,9 @@ public:
     SingleLink<FischerBurmeisterContactForceField<DataTypes1, DataTypes2>, FixedConstraint,
         BaseLink::FLAG_STOREPATH | BaseLink::FLAG_STRONGLINK> l_fixedConstraint;
 
+    SingleLink<FischerBurmeisterContactForceField<DataTypes1, DataTypes2>, ContactMapping,
+        BaseLink::FLAG_STOREPATH | BaseLink::FLAG_STRONGLINK> l_contactMapping;
+
     Data<bool> d_showContactGradients;
     Data<Real> d_drawGradientScale;
     Data<sofa::type::RGBAColor> d_contactColor;
@@ -153,7 +159,7 @@ public:
     Data<sofa::Size> d_activeContactCount;
     Data<sofa::Size> d_pinnedContactCount;
     Data<sofa::Size> d_invalidContactCount;
-    // Active-contact W_ref = H K_ref^{-1} H^T, flattened row-major.
+    // Active-contact W_ref = N J0 P K_ref,f^{-1} P^T J0^T N^T, flattened row-major.
     Data<sofa::type::vector<Real>> d_referenceDelassus;
     Data<sofa::type::vector<unsigned int>> d_referenceDelassusLambdaIndices;
     Data<sofa::Size> d_referenceDelassusSize;
@@ -165,6 +171,7 @@ protected:
 
 public:
     void init() override;
+    void bwdInit() override;
     void reinit() override;
 
     void addForce(const sofa::core::MechanicalParams*, DataVecDeriv1&, DataVecDeriv2&,
@@ -226,7 +233,8 @@ protected:
     sofa::type::vector<Real> m_nextCompliance;
     bool m_hasNextCompliance = false;
 
-    // Translational 3x3 blocks Ctt_ij of C_ref = K_ref^{-1}, row-major.
+    // Contact-space 3x3 blocks of J0 P K_ref,f^{-1} P^T J0^T, row-major.
+    // Historical member/accessor names retained for source compatibility.
     sofa::type::vector<Mat3> m_referenceTranslationalComplianceBlocks;
     sofa::Size m_referenceCompliancePointCount = 0;
 
@@ -236,6 +244,9 @@ protected:
 
     sofa::Size m_cachedReferenceMetricVersion = std::numeric_limits<sofa::Size>::max();
     std::size_t m_cachedConstraintSignature = 0;
+    const void* m_cachedBeamState = nullptr;
+    const ContactMapping* m_cachedMapping = nullptr;
+    sofa::Size m_cachedBeamPointCount = 0;
     bool m_referenceComplianceCacheValid = false;
     sofa::Size m_complianceGeneration = 0;
 
@@ -247,7 +258,6 @@ protected:
     bool initializeContactRows();
     bool rebuildCurrentContacts(const VecCoord1&, const VecCoord2&);
     void finalizeContactRow(Contact&, ContactStatus, Real fixedComplianceScale) const;
-    void updateContactRadiusTerms(Contact& c) const;
     void updateFischerBurmeisterTerms(Contact&) const;
 
     Real complianceForPoint(sofa::Index pointIndex, Real fallback) const;

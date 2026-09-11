@@ -343,8 +343,8 @@ void CylinderNCPContactForceField<TDataTypes1, TDataTypes2>::draw(const core::vi
     constexpr Real twoPi =
         Real(6.283185307179586476925286766559);
 
-    constexpr unsigned int radialSegments = 48;
-    constexpr unsigned int longitudinalGuides = 8;
+    constexpr unsigned int radialSegments = 128;
+    constexpr unsigned int longitudinalGuides = 128;
 
     const Vec3 center = d_center.getValue();
     const Real radius = d_radius.getValue();

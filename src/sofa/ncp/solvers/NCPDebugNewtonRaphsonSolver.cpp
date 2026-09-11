@@ -157,10 +157,17 @@ void NCPDebugNewtonRaphsonSolver::solveNCP(BaseNonLinearFunction& function)
     const unsigned int lmMaxRetries = std::max(d_lmMaxRetries.getValue(), 1u);
     const unsigned int lmStagnationIterations = std::max(d_lmStagnationIterations.getValue(), 1u);
 
+    auto graphAccessor = sofa::helper::getWriteAccessor(d_residualGraph);
+    auto& graph = graphAccessor.wref();
+
+    auto& residualList = graph["residual"];
+    residualList.clear();
+
     ncpFunction->storeSolveState();
     function.evaluateCurrentGuess();
 
     SReal squaredResidual = function.squaredNormLastEvaluation();
+    residualList.push_back(squaredResidual);
     NCPDebugResidualSummary summary = ncpFunction->currentNCPDebugSummary();
     const SReal initialSquaredResidual = squaredResidual;
 
@@ -406,7 +413,7 @@ void NCPDebugNewtonRaphsonSolver::solveNCP(BaseNonLinearFunction& function)
                 const bool complementarityAccepted = trialSummary.complementarityResidualNorm
                     <= std::max(complementarityAbsoluteGuard, complementarityGrowthFactor * baseSummary.complementarityResidualNorm);
 
-                const bool trialAccepted = armijoAccepted;
+                const bool trialAccepted = armijoAccepted || trial == maxLineSearchTrials - 1;
 
                 if (validTrial)
                 {
@@ -499,6 +506,7 @@ void NCPDebugNewtonRaphsonSolver::solveNCP(BaseNonLinearFunction& function)
         {
             ++retainedUpdates;
             acceptedMeritHistory.push_back(0.5_sreal * squaredResidual);
+            residualList.push_back(squaredResidual);
 
             const unsigned int nonMonotoneWindow = std::max(d_nonMonotoneWindow.getValue(), 1u);
             while (acceptedMeritHistory.size() > nonMonotoneWindow)

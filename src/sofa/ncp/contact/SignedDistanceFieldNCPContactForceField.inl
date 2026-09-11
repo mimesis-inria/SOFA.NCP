@@ -20,13 +20,14 @@ template<class TDataTypes1, class TDataTypes2>
 SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::SignedDistanceFieldNCPContactForceField()
     : Base()
     , d_sdfFilename(this->initData(&d_sdfFilename, std::string(), "sdfFilename", "Path to float32 raw phi file. Layout: phi[ix,iy,iz], z fastest."))
+    , d_sdfBSplineCoefficientFilename(this->initData(&d_sdfBSplineCoefficientFilename, std::string(), "sdfBSplineCoefficientFilename", "Optional path to Python-prefiltered float32 cubic B-spline coefficients. Layout: coeff[ix,iy,iz], z fastest."))
     , d_sdfGradientFilename(this->initData(&d_sdfGradientFilename, std::string(), "sdfGradientFilename", "Optional float32 first derivatives. Layout: [fx,fy,fz] per node."))
     , d_sdfHermiteMixedFilename(this->initData(&d_sdfHermiteMixedFilename, std::string(), "sdfHermiteMixedFilename", "Optional float32 mixed derivatives. Layout: [fxy,fxz,fyz,fxyz] per node."))
     , d_sdfHermitePacketFilename(this->initData(&d_sdfHermitePacketFilename, std::string(), "sdfHermitePacketFilename", "Optional float32 full Hermite packet. Layout: [fx,fy,fz,fxy,fxz,fyz,fxyz] per node. Overrides derivative files."))
     , d_origin(this->initData(&d_origin, Vec3(Real(0), Real(0), Real(0)), "sdfOrigin", "World position of grid index 0 0 0."))
     , d_spacing(this->initData(&d_spacing, Vec3(Real(1), Real(1), Real(1)), "sdfSpacing", "Grid spacing dx dy dz."))
     , d_dimensions(this->initData(&d_dimensions, UInt3(0, 0, 0), "sdfDimensions", "Grid dimensions nx ny nz."))
-    , d_interpolationMode(this->initData(&d_interpolationMode, static_cast<unsigned int>(Cubic64), "interpolationMode", "0=Auto, 1=Linear8, 2=Cubic64, 3=HermiteFirstDerivatives, 4=HermiteFull."))
+    , d_interpolationMode(this->initData(&d_interpolationMode, static_cast<unsigned int>(Cubic64), "interpolationMode", "0=Auto, 1=Linear8, 2=Cubic64, 3=HermiteFirstDerivatives, 4=HermiteFull, 5=CubicBSpline64."))
     , d_normalizeGradient(this->initData(&d_normalizeGradient, false, "normalizeGradient", "Normalize grad(phi) before returning gapGradient. This changes the Jacobian unless phi is an exact SDF."))
     , d_geometricStiffnessMode(this->initData(&d_geometricStiffnessMode, static_cast<unsigned int>(ExactSDFHessian), "geometricStiffnessMode", "0=None, 1=ExactSDFHessian, 2=MacklinDiagonal."))
     , d_macklinSecantMinDisplacement(this->initData(&d_macklinSecantMinDisplacement, Real(1e-6), "macklinSecantMinDisplacement", "Minimum accepted-base displacement component used by the Macklin diagonal secant [mm]."))
@@ -70,6 +71,7 @@ const char* SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::i
     case Cubic64: return "Cubic64";
     case HermiteFirstDerivatives: return "HermiteFirstDerivatives";
     case HermiteFull: return "HermiteFull";
+    case CubicBSpline64: return "CubicBSpline64";
     default: return "Unknown";
     }
 }
@@ -90,6 +92,7 @@ template<class TDataTypes1, class TDataTypes2>
 void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::clearGridData()
 {
     m_phi.clear();
+    m_bsplineCoefficients.clear();
     m_gradientData.clear();
     m_mixedDerivativeData.clear();
 
@@ -101,11 +104,13 @@ void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::clearGri
     m_spacing = Vec3(Real(1), Real(1), Real(1));
 
     m_loaded = false;
+    m_hasBSplineCoefficients = false;
     m_hasHermiteFirstDerivatives = false;
     m_hasHermiteMixedDerivatives = false;
 
     resetMacklinGeometricStiffness();
 
+    m_warnedMissingBSplineCoefficients = false;
     m_warnedMissingFirstDerivatives = false;
     m_warnedMissingFullHermite = false;
     m_warnedCubicBoundaryFallback = false;
@@ -117,6 +122,7 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::loadGrid
     clearGridData();
 
     const std::string phiFilename = d_sdfFilename.getValue();
+    const std::string bsplineFilename = d_sdfBSplineCoefficientFilename.getValue();
     const std::string gradFilename = d_sdfGradientFilename.getValue();
     const std::string mixedFilename = d_sdfHermiteMixedFilename.getValue();
     const std::string packetFilename = d_sdfHermitePacketFilename.getValue();
@@ -124,7 +130,15 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::loadGrid
     const Vec3 spacing = d_spacing.getValue();
     const Vec3 origin = d_origin.getValue();
 
-    if (phiFilename.empty())
+    const unsigned int interpolationMode = d_interpolationMode.getValue();
+
+    if (interpolationMode == CubicBSpline64 && bsplineFilename.empty())
+    {
+        msg_error() << "interpolationMode=CubicBSpline64 requires sdfBSplineCoefficientFilename.";
+        return false;
+    }
+
+    if (interpolationMode != CubicBSpline64 && phiFilename.empty())
     {
         msg_error() << "Missing sdfFilename.";
         return false;
@@ -164,11 +178,27 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::loadGrid
         return static_cast<bool>(file);
     };
 
-    if (!readFloatFile(phiFilename, count, m_phi))
+    if (!phiFilename.empty())
     {
-        msg_error() << "Failed reading SDF phi raw file: " << phiFilename << ". Expected " << count << " float32 values.";
-        clearGridData();
-        return false;
+        if (!readFloatFile(phiFilename, count, m_phi))
+        {
+            msg_error() << "Failed reading SDF phi raw file: " << phiFilename << ". Expected " << count << " float32 values.";
+            clearGridData();
+            return false;
+        }
+    }
+
+    if (!bsplineFilename.empty())
+    {
+        if (!readFloatFile(bsplineFilename, count, m_bsplineCoefficients))
+        {
+            msg_error() << "Failed reading cubic B-spline coefficient raw file: " << bsplineFilename
+                        << ". Expected " << count << " float32 values.";
+            clearGridData();
+            return false;
+        }
+
+        m_hasBSplineCoefficients = true;
     }
 
     if (!packetFilename.empty())
@@ -237,13 +267,15 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::loadGrid
         return false;
     }
 
-    m_loaded = true;
+    m_loaded = !m_phi.empty() || m_hasBSplineCoefficients;
 
     msg_info() << "Loaded SDF phi='" << phiFilename
+               << "' bsplineCoefficients='" << bsplineFilename
                << "' dims=" << m_nx << " " << m_ny << " " << m_nz
                << " origin=" << m_origin
                << " spacing=" << m_spacing
                << " interpolationMode=" << interpolationModeName(d_interpolationMode.getValue())
+               << " hasBSplineCoefficients=" << m_hasBSplineCoefficients
                << " hasFirstDerivatives=" << m_hasHermiteFirstDerivatives
                << " hasMixedDerivatives=" << m_hasHermiteMixedDerivatives
                << " normalizeGradient=" << d_normalizeGradient.getValue()
@@ -268,6 +300,60 @@ typename SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::Real
 SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::phiAt(unsigned int i,unsigned int j,unsigned int k) const
 {
     return static_cast<Real>(m_phi[flattenedIndex(i, j, k)]);
+}
+
+template<class TDataTypes1, class TDataTypes2>
+unsigned int SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::mirroredIndex(int index, unsigned int size)
+{
+    if (size <= 1)
+        return 0;
+
+    const int period = 2 * (static_cast<int>(size) - 1);
+    int wrapped = index % period;
+    if (wrapped < 0)
+        wrapped += period;
+    if (wrapped >= static_cast<int>(size))
+        wrapped = period - wrapped;
+
+    return static_cast<unsigned int>(wrapped);
+}
+
+template<class TDataTypes1, class TDataTypes2>
+typename SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::Real
+SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::bsplineCoefficientAt(int i,int j,int k) const
+{
+    const unsigned int ii = mirroredIndex(i, m_nx);
+    const unsigned int jj = mirroredIndex(j, m_ny);
+    const unsigned int kk = mirroredIndex(k, m_nz);
+    return static_cast<Real>(m_bsplineCoefficients[flattenedIndex(ii, jj, kk)]);
+}
+
+template<class TDataTypes1, class TDataTypes2>
+void SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::cubicBSplineBasis(
+    Real t,
+    Real W[4],
+    Real dW[4],
+    Real ddW[4])
+{
+    const Real t2 = t * t;
+    const Real t3 = t2 * t;
+    const Real oneMinusT = Real(1) - t;
+    const Real inv6 = Real(1) / Real(6);
+
+    W[0] = oneMinusT * oneMinusT * oneMinusT * inv6;
+    W[1] = (Real(3) * t3 - Real(6) * t2 + Real(4)) * inv6;
+    W[2] = (Real(-3) * t3 + Real(3) * t2 + Real(3) * t + Real(1)) * inv6;
+    W[3] = t3 * inv6;
+
+    dW[0] = (Real(-3) + Real(6) * t - Real(3) * t2) * inv6;
+    dW[1] = (Real(9) * t2 - Real(12) * t) * inv6;
+    dW[2] = (Real(-9) * t2 + Real(6) * t + Real(3)) * inv6;
+    dW[3] = Real(3) * t2 * inv6;
+
+    ddW[0] = Real(1) - t;
+    ddW[1] = Real(3) * t - Real(2);
+    ddW[2] = Real(1) - Real(3) * t;
+    ddW[3] = t;
 }
 
 template<class TDataTypes1, class TDataTypes2>
@@ -321,13 +407,29 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::validate
 template<class TDataTypes1, class TDataTypes2>
 bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate(const Vec3& p,Real& phi,Vec3& gradPhi) const
 {
-    if (!m_loaded || m_phi.empty())
+    const unsigned int mode = d_interpolationMode.getValue();
+
+    if (!m_loaded)
     {
         if (d_debugQueries.getValue()) msg_warning() << "[SDF invalid] not loaded or empty.";
         return false;
     }
 
-    const unsigned int mode = d_interpolationMode.getValue();
+    if (mode == CubicBSpline64 && !m_hasBSplineCoefficients)
+    {
+        if (!m_warnedMissingBSplineCoefficients)
+        {
+            msg_warning() << "interpolationMode=CubicBSpline64 but no sdfBSplineCoefficientFilename was loaded.";
+            m_warnedMissingBSplineCoefficients = true;
+        }
+        return false;
+    }
+
+    if (mode != CubicBSpline64 && m_phi.empty())
+    {
+        if (d_debugQueries.getValue()) msg_warning() << "[SDF invalid] interpolation mode requires sdfFilename, but phi data is empty.";
+        return false;
+    }
 
     if (mode == Auto)
     {
@@ -341,6 +443,9 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
 
     if (mode == Cubic64)
         return evaluateCubic64(p, phi, gradPhi);
+
+    if (mode == CubicBSpline64)
+        return evaluateCubicBSpline64(p, phi, gradPhi);
 
     if (mode == HermiteFirstDerivatives)
     {
@@ -533,6 +638,64 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
 }
 
 template<class TDataTypes1, class TDataTypes2>
+bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluateCubicBSpline64(const Vec3& p,Real& phi,Vec3& gradPhi) const
+{
+    if (!m_hasBSplineCoefficients || m_bsplineCoefficients.empty())
+        return false;
+
+    const Real gx = (p[0] - m_origin[0]) / m_spacing[0];
+    const Real gy = (p[1] - m_origin[1]) / m_spacing[1];
+    const Real gz = (p[2] - m_origin[2]) / m_spacing[2];
+
+    if (gx < Real(0) || gx >= Real(m_nx - 1) ||
+        gy < Real(0) || gy >= Real(m_ny - 1) ||
+        gz < Real(0) || gz >= Real(m_nz - 1))
+        return false;
+
+    const int i = static_cast<int>(std::floor(gx));
+    const int j = static_cast<int>(std::floor(gy));
+    const int k = static_cast<int>(std::floor(gz));
+
+    const Real u = gx - Real(i);
+    const Real v = gy - Real(j);
+    const Real w = gz - Real(k);
+
+    Real wx[4], dwx[4], ddwx[4];
+    Real wy[4], dwy[4], ddwy[4];
+    Real wz[4], dwz[4], ddwz[4];
+    cubicBSplineBasis(u, wx, dwx, ddwx);
+    cubicBSplineBasis(v, wy, dwy, ddwy);
+    cubicBSplineBasis(w, wz, dwz, ddwz);
+
+    phi = Real(0);
+    Real du = Real(0);
+    Real dv = Real(0);
+    Real dw = Real(0);
+
+    for (int a = 0; a < 4; ++a)
+    {
+        const int ii = i + a - 1;
+        for (int b = 0; b < 4; ++b)
+        {
+            const int jj = j + b - 1;
+            for (int c = 0; c < 4; ++c)
+            {
+                const int kk = k + c - 1;
+                const Real coefficient = bsplineCoefficientAt(ii, jj, kk);
+
+                phi += coefficient * wx[a]  * wy[b]  * wz[c];
+                du  += coefficient * dwx[a] * wy[b]  * wz[c];
+                dv  += coefficient * wx[a]  * dwy[b] * wz[c];
+                dw  += coefficient * wx[a]  * wy[b]  * dwz[c];
+            }
+        }
+    }
+
+    gradPhi = Vec3(du / m_spacing[0], dv / m_spacing[1], dw / m_spacing[2]);
+    return validateAndNormalizeGradient(p, phi, gradPhi);
+}
+
+template<class TDataTypes1, class TDataTypes2>
 bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluateHermiteFirst(const Vec3& p,Real& phi,Vec3& gradPhi) const
 {
     return evaluateHermiteCell(p, false, phi, gradPhi);
@@ -706,20 +869,30 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::computeG
     if (geometricMode != ExactSDFHessian)
         return false;
 
-    if (!m_loaded || m_phi.empty())
+    if (!m_loaded)
         return false;
+
+    const unsigned int interpolationMode = d_interpolationMode.getValue();
+    if (interpolationMode == CubicBSpline64)
+    {
+        if (!m_hasBSplineCoefficients || m_bsplineCoefficients.empty())
+            return false;
+    }
+    else if (m_phi.empty())
+    {
+        return false;
+    }
 
     // With normalized gradients the contact force direction is no longer the
     // exact derivative of g=-phi, so the analytic -Hess(phi) is inconsistent.
     // The Macklin mode remains valid because it finite-differences the actual
     // gapGradient returned by computeContactKinematics().
-    if (d_normalizeGradient.getValue())
-        return false;
+    // if (d_normalizeGradient.getValue())
+    //     return false;
 
     Mat3 hessianPhi;
     hessianPhi.clear();
 
-    const unsigned int interpolationMode = d_interpolationMode.getValue();
     bool valid = false;
 
     if (interpolationMode == Auto)
@@ -735,6 +908,10 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::computeG
     else if (interpolationMode == Cubic64)
     {
         valid = evaluateCubic64Hessian(p, hessianPhi);
+    }
+    else if (interpolationMode == CubicBSpline64)
+    {
+        valid = evaluateCubicBSpline64Hessian(p, hessianPhi);
     }
     else if (interpolationMode == HermiteFirstDerivatives)
     {
@@ -921,6 +1098,82 @@ bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluate
                 duv += f * dwx[a]  * dwy[b]  * wz[c];
                 duw += f * dwx[a]  * wy[b]   * dwz[c];
                 dvw += f * wx[a]   * dwy[b]  * dwz[c];
+            }
+        }
+    }
+
+    const Real hx = m_spacing[0];
+    const Real hy = m_spacing[1];
+    const Real hz = m_spacing[2];
+
+    hessianPhi(0, 0) = duu / (hx * hx);
+    hessianPhi(1, 1) = dvv / (hy * hy);
+    hessianPhi(2, 2) = dww / (hz * hz);
+    hessianPhi(0, 1) = hessianPhi(1, 0) = duv / (hx * hy);
+    hessianPhi(0, 2) = hessianPhi(2, 0) = duw / (hx * hz);
+    hessianPhi(1, 2) = hessianPhi(2, 1) = dvw / (hy * hz);
+
+    return true;
+}
+
+template<class TDataTypes1, class TDataTypes2>
+bool SignedDistanceFieldNCPContactForceField<TDataTypes1, TDataTypes2>::evaluateCubicBSpline64Hessian(
+    const Vec3& p,
+    Mat3& hessianPhi) const
+{
+    hessianPhi.clear();
+
+    if (!m_hasBSplineCoefficients || m_bsplineCoefficients.empty())
+        return false;
+
+    const Real gx = (p[0] - m_origin[0]) / m_spacing[0];
+    const Real gy = (p[1] - m_origin[1]) / m_spacing[1];
+    const Real gz = (p[2] - m_origin[2]) / m_spacing[2];
+
+    if (gx < Real(0) || gx >= Real(m_nx - 1) ||
+        gy < Real(0) || gy >= Real(m_ny - 1) ||
+        gz < Real(0) || gz >= Real(m_nz - 1))
+        return false;
+
+    const int i = static_cast<int>(std::floor(gx));
+    const int j = static_cast<int>(std::floor(gy));
+    const int k = static_cast<int>(std::floor(gz));
+
+    const Real u = gx - Real(i);
+    const Real v = gy - Real(j);
+    const Real w = gz - Real(k);
+
+    Real wx[4], dwx[4], ddwx[4];
+    Real wy[4], dwy[4], ddwy[4];
+    Real wz[4], dwz[4], ddwz[4];
+    cubicBSplineBasis(u, wx, dwx, ddwx);
+    cubicBSplineBasis(v, wy, dwy, ddwy);
+    cubicBSplineBasis(w, wz, dwz, ddwz);
+
+    Real duu = Real(0);
+    Real dvv = Real(0);
+    Real dww = Real(0);
+    Real duv = Real(0);
+    Real duw = Real(0);
+    Real dvw = Real(0);
+
+    for (int a = 0; a < 4; ++a)
+    {
+        const int ii = i + a - 1;
+        for (int b = 0; b < 4; ++b)
+        {
+            const int jj = j + b - 1;
+            for (int c = 0; c < 4; ++c)
+            {
+                const int kk = k + c - 1;
+                const Real coefficient = bsplineCoefficientAt(ii, jj, kk);
+
+                duu += coefficient * ddwx[a] * wy[b]   * wz[c];
+                dvv += coefficient * wx[a]   * ddwy[b] * wz[c];
+                dww += coefficient * wx[a]   * wy[b]   * ddwz[c];
+                duv += coefficient * dwx[a]  * dwy[b]  * wz[c];
+                duw += coefficient * dwx[a]  * wy[b]   * dwz[c];
+                dvw += coefficient * wx[a]   * dwy[b]  * dwz[c];
             }
         }
     }

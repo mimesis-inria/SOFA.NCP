@@ -36,6 +36,11 @@
 *       Full tensor-product tricubic Hermite using f, fx, fy, fz, fxy, fxz,
 *       fyz, fxyz at the 8 cell corners.
 *
+*   5 CubicBSpline64
+*       Tensor-product cubic cardinal B-spline evaluated from prefiltered
+*       coefficients supplied directly by Python. Uses 4x4x4=64 coefficients
+*       and returns analytic value, gradient, and Hessian of the same C2 field.
+*
 * Geometric stiffness modes:
 *   0 None
 *       Drop lambda Hess(g) from the Newton tangent.
@@ -51,6 +56,9 @@
 *
 * Raw files:
 *   sdfFilename                 : float32 phi[ix,iy,iz], C-order, z fastest.
+*   sdfBSplineCoefficientFilename: optional float32 cubic B-spline coefficients
+*                                  coeff[ix,iy,iz], C-order, z fastest. These
+*                                  coefficients are prefiltered externally.
 *   sdfGradientFilename          : optional float32 [fx,fy,fz] per grid node.
 *   sdfHermiteMixedFilename      : optional float32 [fxy,fxz,fyz,fxyz] per node.
 *   sdfHermitePacketFilename     : optional float32 [fx,fy,fz,fxy,fxz,fyz,fxyz]
@@ -105,7 +113,8 @@ public:
         Linear8 = 1,
         Cubic64 = 2,
         HermiteFirstDerivatives = 3,
-        HermiteFull = 4
+        HermiteFull = 4,
+        CubicBSpline64 = 5
     };
 
     enum GeometricStiffnessMode : unsigned int
@@ -124,6 +133,7 @@ public:
     };
 
     Data<std::string> d_sdfFilename;
+    Data<std::string> d_sdfBSplineCoefficientFilename;
     Data<std::string> d_sdfGradientFilename;
     Data<std::string> d_sdfHermiteMixedFilename;
     Data<std::string> d_sdfHermitePacketFilename;
@@ -132,7 +142,7 @@ public:
     Data<Vec3> d_spacing;
     Data<UInt3> d_dimensions;
 
-    /// 0=Auto, 1=Linear8, 2=Cubic64, 3=HermiteFirstDerivatives, 4=HermiteFull.
+    /// 0=Auto, 1=Linear8, 2=Cubic64, 3=HermiteFirstDerivatives, 4=HermiteFull, 5=CubicBSpline64.
     Data<unsigned int> d_interpolationMode;
 
     /// Normalize grad(phi) before returning gapGradient. Keep false for an exact derivative of the interpolated gap.
@@ -171,12 +181,14 @@ protected:
     bool evaluate(const Vec3& p, Real& phi, Vec3& gradPhi) const;
     bool evaluateLinear8(const Vec3& p, Real& phi, Vec3& gradPhi) const;
     bool evaluateCubic64(const Vec3& p, Real& phi, Vec3& gradPhi) const;
+    bool evaluateCubicBSpline64(const Vec3& p, Real& phi, Vec3& gradPhi) const;
     bool evaluateHermiteFirst(const Vec3& p, Real& phi, Vec3& gradPhi) const;
     bool evaluateHermiteFull(const Vec3& p, Real& phi, Vec3& gradPhi) const;
     bool evaluateHermiteCell(const Vec3& p, bool useMixedDerivatives, Real& phi, Vec3& gradPhi) const;
 
     bool evaluateLinear8Hessian(const Vec3& p, Mat3& hessianPhi) const;
     bool evaluateCubic64Hessian(const Vec3& p, Mat3& hessianPhi) const;
+    bool evaluateCubicBSpline64Hessian(const Vec3& p, Mat3& hessianPhi) const;
     bool evaluateHermiteCellHessian(const Vec3& p, bool useMixedDerivatives, Mat3& hessianPhi) const;
 
     bool validateAndNormalizeGradient(const Vec3& p, Real phi, Vec3& gradPhi) const;
@@ -184,9 +196,12 @@ protected:
     sofa::Size flattenedIndex(unsigned int i, unsigned int j, unsigned int k) const;
 
     Real phiAt(unsigned int i, unsigned int j, unsigned int k) const;
+    Real bsplineCoefficientAt(int i, int j, int k) const;
     Vec3 gradAt(unsigned int i, unsigned int j, unsigned int k) const;
     HermiteMixedDerivatives mixedAt(unsigned int i, unsigned int j, unsigned int k) const;
 
+    static unsigned int mirroredIndex(int index, unsigned int size);
+    static void cubicBSplineBasis(Real t, Real W[4], Real dW[4], Real ddW[4]);
     static const char* interpolationModeName(unsigned int mode);
     static const char* geometricStiffnessModeName(unsigned int mode);
 
@@ -197,6 +212,7 @@ protected:
     void drawGridBox(const core::visual::VisualParams* vparams) const;
 
     std::vector<float> m_phi;
+    std::vector<float> m_bsplineCoefficients;
     std::vector<float> m_gradientData;
     std::vector<float> m_mixedDerivativeData;
 
@@ -207,6 +223,7 @@ protected:
     Vec3 m_origin = Vec3(Real(0), Real(0), Real(0));
     Vec3 m_spacing = Vec3(Real(1), Real(1), Real(1));
     bool m_loaded = false;
+    bool m_hasBSplineCoefficients = false;
     bool m_hasHermiteFirstDerivatives = false;
     bool m_hasHermiteMixedDerivatives = false;
 
@@ -219,6 +236,7 @@ protected:
     std::vector<Mat3> m_macklinGapHessians;
     bool m_macklinHistoryValid = false;
 
+    mutable bool m_warnedMissingBSplineCoefficients = false;
     mutable bool m_warnedMissingFirstDerivatives = false;
     mutable bool m_warnedMissingFullHermite = false;
     mutable bool m_warnedCubicBoundaryFallback = false;

@@ -314,24 +314,84 @@ bool FischerBurmeisterContactForceField<T1, T2>::hasValidKinematics(const Contac
 }
 
 template<class T1, class T2>
+void FischerBurmeisterContactForceField<T1, T2>::updateContactRadiusTerms(Contact& c) const
+{
+    c.rotationalGapGradient.clear();
+
+    const auto* beam = l_beamForceField.get();
+    if (!beam)
+        return;
+
+    const Real catheterRadius = beam->d_radius.getValue();
+
+    // Default spherical correction for non-Rigid types.
+    Real radiusCorrection = catheterRadius;
+
+    if constexpr (std::is_same_v<T1, sofa::defaulttype::Rigid3Types>)
+    {
+        if (!this->mstate1 || c.pointIndex >= this->mstate1->getSize())
+            return;
+
+        const auto x1Data = this->mstate1->read(core::vec_id::read_access::position);
+        const VecCoord1& x1 = x1Data->getValue();
+
+        const auto& q = x1[c.pointIndex].getOrientation();
+
+        // Beam longitudinal direction = local +x.
+        Vec3 tangent = q.rotate(Vec3(Real(1), Real(0), Real(0)));
+        tangent.normalize();
+
+        Vec3 normal = c.gapGradient;
+        const Real normalNorm = normal.norm();
+
+        if (normalNorm > Real(1e-12))
+        {
+            normal /= normalNorm;
+
+            // Projection of the vessel normal onto the beam cross-section.
+            Vec3 radial = normal - tangent * (normal * tangent);
+            const Real radialNorm = radial.norm();
+
+            // Effective extent of the circular section along the contact normal.
+            radiusCorrection = catheterRadius * radialNorm;
+
+            if (radialNorm > Real(1e-12))
+            {
+                radial /= radialNorm;
+
+                // gapGradient points toward increasing gap (inside lumen),
+                // therefore the catheter surface nearest the wall is opposite radial.
+                const Vec3 lever = -catheterRadius * radial;
+
+                // Rotational part of H.
+                c.rotationalGapGradient = cross(lever, normal);
+            }
+        }
+    }
+
+    c.gap -= radiusCorrection;
+}
+
+template<class T1, class T2>
 void FischerBurmeisterContactForceField<T1, T2>::updateFischerBurmeisterTerms(Contact& c) const
 {
     const Real eps = d_fbEpsilon.getValue();
     const Real r = c.complianceScale;
-    const Real contactCompliance = 0;
+    const Real contactCompliance = Real(0);
 
     const Real effectiveGap = c.gap + contactCompliance * c.lambda;
+
     const Real s = r * c.lambda;
-    const Real n = std::sqrt(effectiveGap * effectiveGap+ s * s+ eps * eps);
+    const Real n = std::sqrt(
+        effectiveGap * effectiveGap
+        + s * s
+        + eps * eps);
 
     c.scaledLambda = s;
 
     const Real phi = effectiveGap + s - n;
 
-    // d phi / d g_eff
     const Real a = Real(1) - effectiveGap / n;
-
-    // Contribution from s = r * lambda.
     const Real b = r * (Real(1) - s / n);
     const Real invR = Real(1) / r;
 
@@ -353,11 +413,41 @@ FischerBurmeisterContactForceField<T1, T2>::complianceForPoint(sofa::Index point
 template<class T1, class T2>
 void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, ContactStatus geometryStatus, Real fixedR) const
 {
-    if (geometryStatus == ContactStatus::Pinned || c.gap >= 0.5)
+    const auto* beam = l_beamForceField.get();
+    if (!beam)
+        return;
+
+    const Real catheterRadius = beam->d_radius.getValue();
+
+    const auto* constraint = l_fixedConstraint.get();
+
+    if (constraint)
+    {
+        const auto& constrainedIndices = constraint->d_indices.getValue();
+
+        const bool constrained = constraint->fixAllDOFs() || std::find(constrainedIndices.begin(), constrainedIndices.end(), c.pointIndex) != constrainedIndices.end();
+
+        if (constrained)
+        {
+            c.status = ContactStatus::Pinned;
+            c.gap = Real(0);
+            c.gapGradient.clear();
+            c.rotationalGapGradient.clear();
+            c.complianceScale = Real(1);
+            c.scaledLambda = c.lambda;
+            c.phi = c.lambda;
+            c.dPhiDgap = Real(0);
+            c.dPhiDlambda = Real(1);
+            return;
+        }
+    }
+
+    if (geometryStatus == ContactStatus::Pinned) // || c.gap >= catheterRadius + Real(0.5)
     {
         c.status = ContactStatus::Pinned;
         c.gap = Real(0);
         c.gapGradient.clear();
+        c.rotationalGapGradient.clear();
         c.complianceScale = Real(1);
         c.scaledLambda = c.lambda;
         c.phi = c.lambda;
@@ -371,6 +461,7 @@ void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, 
         c.status = ContactStatus::InvalidGeometry;
         c.gap = Real(0);
         c.gapGradient.clear();
+        c.rotationalGapGradient.clear();
         c.complianceScale = Real(1);
         c.scaledLambda = c.lambda;
         c.phi = c.lambda;
@@ -381,6 +472,8 @@ void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, 
 
     c.status = ContactStatus::Active;
     c.complianceScale = complianceForPoint(c.pointIndex, fixedR);
+    // updateContactRadiusTerms(c);
+    c.gap -= catheterRadius;
     updateFischerBurmeisterTerms(c);
 }
 
@@ -477,10 +570,13 @@ void FischerBurmeisterContactForceField<T1, T2>::invalidateReferenceComplianceCa
     m_referenceCompliancePointCount = 0;
     clearReferenceDelassus();
 
-    m_currentCompliance.clear();
+    // A pending compliance was computed from the old reference cache
+    // and must therefore be discarded.
     m_nextCompliance.clear();
-    m_hasCurrentCompliance = false;
     m_hasNextCompliance = false;
+
+    // Keep m_currentCompliance as the last valid lagged snapshot.
+    // It remains the fallback if rebuilding the reference cache fails.
 
     m_cachedReferenceMetricVersion = std::numeric_limits<sofa::Size>::max();
     m_cachedConstraintSignature = 0;
@@ -1489,6 +1585,12 @@ void FischerBurmeisterContactForceField<T1, T2>::addForce(const sofa::core::Mech
             // Physical contact residual: R_x^c = H^T lambda.
             for (sofa::Size d = 0; d < TranslationalDim; ++d)
                 f1[c.pointIndex][d] += c.lambda * c.gapGradient[d];
+            
+            // if constexpr (std::is_same_v<T1, sofa::defaulttype::Rigid3Types>)
+            // {
+            //     for (sofa::Size d = 0; d < 3; ++d)
+            //         f1[c.pointIndex][3 + d] += c.lambda * c.rotationalGapGradient[d];
+            // }
         }
 
         f2[c.lambdaIndex][0] += c.phi;
@@ -1566,7 +1668,7 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
 {
     if (!matrix || !m_validState || !this->mstate1 || !this->mstate2)
         return;
-
+    
     // Exact contact Jacobian for
     //
     //     R_x      = H^T lambda
@@ -1619,6 +1721,15 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
             // J_lambdax = dphi/dg * dg/dx = a H.
             for (sofa::Size d = 0; d < TranslationalDim; ++d)
                 lowerLeft(0, d) = c.dPhiDgap * c.gapGradient[d];
+
+            // if constexpr (std::is_same_v<T1, sofa::defaulttype::Rigid3Types>)
+            // {
+            //     for (sofa::Size d = 0; d < 3; ++d)
+            //     {
+            //         // upperRight(3 + d, 0) = c.rotationalGapGradient[d];
+            //         lowerLeft(0, 3 + d) = c.dPhiDgap * c.rotationalGapGradient[d];
+            //     }
+            // }
 
             // Optional J_xx = lambda Hess(g).
             Mat3 gapHessian;
@@ -1689,7 +1800,7 @@ void FischerBurmeisterContactForceField<T1, T2>::drawActiveNormals(const core::v
         const Real norm2 = c.gapGradient.norm2();
         if (c.status != ContactStatus::Active
             || c.pointIndex >= x1.size()
-            || c.gap > Real(1e-2)
+            || c.lambda < Real(10.0)
             || norm2 <= Real(1e-30))
         {
             continue;

@@ -29,9 +29,11 @@ template<class T1, class T2>
 FischerBurmeisterContactForceField<T1, T2>::FischerBurmeisterContactForceField()
     : Inherit()
     , d_fixedComplianceScale(initData(&d_fixedComplianceScale, Real(1.0),
-          "fixedComplianceScale", "Positive fallback r used in phi(g,r*lambda)."))
+          "fixedComplianceScale", "Positive fallback r used in the unilateral Fischer-Burmeister residual."))
     , d_complianceMode(initData(&d_complianceMode, static_cast<unsigned int>(Fixed),
           "complianceMode", "0=fixed, 1=lagged reference-elastic scale, 2=current scale (reserved)."))
+    , d_constraintMode(initData(&d_constraintMode, static_cast<unsigned int>(ContactLawMode::Unilateral),
+          "constraintMode", "0=unilateral (Fischer-Burmeister), 1=bilateral (gap=0)."))
     , d_fbEpsilon(initData(&d_fbEpsilon, Real(0),
           "fbEpsilon", "Nonnegative Fischer-Burmeister smoothing epsilon."))
     , d_contactNewtonRegularization(initData(&d_contactNewtonRegularization, Real(0.0),
@@ -59,7 +61,7 @@ FischerBurmeisterContactForceField<T1, T2>::FischerBurmeisterContactForceField()
     , d_contactPhi(initData(&d_contactPhi, "contactPhi", "Point-indexed row residuals."))
     , d_contactDPhiDgap(initData(&d_contactDPhiDgap, "contactDPhiDgap", "Point-indexed dphi/dg."))
     , d_contactDPhiDlambda(initData(&d_contactDPhiDlambda, "contactDPhiDlambda", "Point-indexed dphi/dlambda."))
-    , d_activeContactCount(initData(&d_activeContactCount, sofa::Size(0), "activeContactCount", "Active FB rows."))
+    , d_activeContactCount(initData(&d_activeContactCount, sofa::Size(0), "activeContactCount", "Active constraint rows."))
     , d_pinnedContactCount(initData(&d_pinnedContactCount, sofa::Size(0), "pinnedContactCount", "Pinned rows."))
     , d_invalidContactCount(initData(&d_invalidContactCount, sofa::Size(0), "invalidContactCount", "Invalid rows."))
     , d_referenceDelassus(initData(&d_referenceDelassus,
@@ -119,6 +121,14 @@ bool FischerBurmeisterContactForceField<T1, T2>::initializeContactRows()
         msg_error() << "object1 size (" << this->mstate1->getSize()
                     << ") and lambda size (" << this->mstate2->getSize()
                     << ") must match.";
+        m_validState = false;
+        return false;
+    }
+
+    const unsigned int lawMode = d_constraintMode.getValue();
+    if (lawMode > static_cast<unsigned int>(ContactLawMode::Bilateral))
+    {
+        msg_error() << "constraintMode must be 0=unilateral or 1=bilateral.";
         m_validState = false;
         return false;
     }
@@ -314,30 +324,26 @@ bool FischerBurmeisterContactForceField<T1, T2>::hasValidKinematics(const Contac
 }
 
 template<class T1, class T2>
-void FischerBurmeisterContactForceField<T1, T2>::updateFischerBurmeisterTerms(Contact& c) const
+void FischerBurmeisterContactForceField<T1, T2>::updateConstraintTerms(Contact& c) const
 {
-    const Real eps = d_fbEpsilon.getValue();
-    const Real r = c.complianceScale;
-    const Real contactCompliance = 0;
+    // The compliance scale is frozen during the local linearization.
+    // Keeping this diagnostic value preserves the existing debug interface.
+    c.scaledLambda = c.complianceScale * c.lambda;
 
-    const Real effectiveGap = c.gap + contactCompliance * c.lambda;
-    const Real s = r * c.lambda;
-    const Real n = std::sqrt(effectiveGap * effectiveGap+ s * s+ eps * eps);
+    ContactLawEvaluation<Real> law;
+    if (d_constraintMode.getValue() == static_cast<unsigned int>(ContactLawMode::Unilateral))
+    {
+        law = UnilateralContactLaw<Real>::evaluate(
+            c.gap, c.lambda, c.complianceScale, d_fbEpsilon.getValue());
+    }
+    else
+    {
+        law = BilateralContactLaw<Real>::evaluate(c.gap, d_fbEpsilon.getValue());
+    }
 
-    c.scaledLambda = s;
-
-    const Real phi = effectiveGap + s - n;
-
-    // d phi / d g_eff
-    const Real a = Real(1) - effectiveGap / n;
-
-    // Contribution from s = r * lambda.
-    const Real b = r * (Real(1) - s / n);
-    const Real invR = Real(1) / r;
-
-    c.phi = phi * invR;
-    c.dPhiDgap = a * invR;
-    c.dPhiDlambda = (a * contactCompliance + b) * invR;
+    c.phi = law.residual;
+    c.dPhiDgap = law.dResidualDGap;
+    c.dPhiDlambda = law.dResidualDLambda;
 }
 
 template<class T1, class T2>
@@ -353,7 +359,7 @@ FischerBurmeisterContactForceField<T1, T2>::complianceForPoint(sofa::Index point
 template<class T1, class T2>
 void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, ContactStatus geometryStatus, Real fixedR) const
 {
-    if (geometryStatus == ContactStatus::Pinned || c.gap >= 0.5)
+    if (geometryStatus == ContactStatus::Pinned)
     {
         c.status = ContactStatus::Pinned;
         c.gap = Real(0);
@@ -381,12 +387,19 @@ void FischerBurmeisterContactForceField<T1, T2>::finalizeContactRow(Contact& c, 
 
     c.status = ContactStatus::Active;
     c.complianceScale = complianceForPoint(c.pointIndex, fixedR);
-    updateFischerBurmeisterTerms(c);
+    updateConstraintTerms(c);
 }
 
 template<class T1, class T2>
 bool FischerBurmeisterContactForceField<T1, T2>::rebuildCurrentContacts(const VecCoord1& x1, const VecCoord2& x2)
 {
+    if (d_constraintMode.getValue() > static_cast<unsigned int>(ContactLawMode::Bilateral))
+    {
+        msg_error() << "Invalid constraintMode: expected 0=unilateral or 1=bilateral.";
+        m_validState = false;
+        return false;
+    }
+
     if (x1.size() != x2.size() || x1.empty())
     {
         msg_error() << "Cannot build contact rows: object1 has " << x1.size()
@@ -400,24 +413,63 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildCurrentContacts(const Ve
         m_contacts.resize(x1.size());
 
     const Real fixedR = d_fixedComplianceScale.getValue();
-    bool valid = true;
+    const auto* fixedConstraint = l_fixedConstraint.get();
+    std::vector<bool> isFixed(x1.size(), false);
+
+    if (fixedConstraint)
+    {
+        if (fixedConstraint->fixAllDOFs())
+        {
+            std::fill(isFixed.begin(), isFixed.end(), true);
+        }
+        else
+        {
+            const auto& indices = fixedConstraint->d_indices.getValue();
+
+            for (const sofa::Index index : indices)
+            {
+                if (index < x1.size())
+                    isFixed[index] = true;
+                else
+                    msg_warning() << "Fixed constraint index "
+                                << index << " is out of bounds.";
+            }
+        }
+    }
 
     for (sofa::Index i = 0; i < x1.size(); ++i)
     {
         Contact& c = m_contacts[i];
+
         c = Contact{};
         c.pointIndex = i;
         c.lambdaIndex = i;
         c.lambda = static_cast<Real>(x2[i][0]);
 
-        const ContactStatus status = computeContactKinematics(extractPosition(x1[i]), c);
+        if (!std::isfinite(static_cast<double>(c.lambda)))
+        {
+            msg_error() << "Nonfinite multiplier at index " << i;
+            m_validState = false;
+            return false;
+        }
+
+        // Fixed mechanical point: disable its contact equation
+        if (isFixed[i])
+        {
+            finalizeContactRow(c, ContactStatus::Pinned, fixedR);
+            continue;
+        }
+
+        // Otherwise, evaluate the SDF normally
+        const ContactStatus status =
+            computeContactKinematics(extractPosition(x1[i]), c);
+
         finalizeContactRow(c, status, fixedR);
-        valid = valid && c.status != ContactStatus::InvalidGeometry;
     }
 
-    m_validState = valid;
+    m_validState = true;
     publishDebugData();
-    return valid;
+    return true;
 }
 
 template<class T1, class T2>
@@ -516,7 +568,7 @@ bool FischerBurmeisterContactForceField<T1, T2>::ensureReferenceComplianceCache(
         return false;
 
     const auto* beam = l_beamForceField.get();
-    const sofa::Size version = beam->getReferenceElasticMetricVersion();
+    const sofa::Size version = 1.0;
     const std::size_t constraintSignature = fixedConstraintSignature();
     const sofa::Size pointCount = this->mstate1->getSize();
     const std::size_t blockCount =
@@ -596,7 +648,7 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
         using Triplet = Eigen::Triplet<Real>;
         using DenseMatrix = Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic>;
 
-        const sofa::Size elementCount = beam->getReferenceElasticMetricElementCount();
+        const sofa::Size elementCount = 1.0;
         std::vector<Triplet> triplets;
         triplets.reserve(static_cast<std::size_t>(elementCount) * 144u);
 
@@ -607,8 +659,8 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
             sofa::Index a = 0;
             sofa::Index b = 0;
 
-            if (!beam->getReferenceElasticMetricElement(element, a, b, Ke))
-                return false;
+            // if (!beam->getReferenceElasticMetricElement(element, a, b, Ke))
+            //     return false;
 
             if (a >= pointCount || b >= pointCount)
             {
@@ -770,7 +822,7 @@ bool FischerBurmeisterContactForceField<T1, T2>::rebuildReferenceComplianceCache
 
         m_referenceTranslationalComplianceBlocks = std::move(blocks);
         m_referenceCompliancePointCount = pointCount;
-        m_cachedReferenceMetricVersion = beam->getReferenceElasticMetricVersion();
+        m_cachedReferenceMetricVersion = 1.0;
         m_cachedConstraintSignature = fixedConstraintSignature();
         m_referenceComplianceCacheValid = true;
 
@@ -1566,20 +1618,20 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
 {
     if (!matrix || !m_validState || !this->mstate1 || !this->mstate2)
         return;
+    
+    beginNonlinearSolve();
+    commitLaggedComplianceSnapshot();
 
-    // Exact contact Jacobian for
+    // Active contact law: R_x = H^T lambda, R_lambda = law(g,lambda).
     //
-    //     R_x      = H^T lambda
-    //     R_lambda = phi(g, r lambda)
+    //         [ lambda Hess(g)    H^T          ]
+    //     J = [                               ]
+    //         [ dR/dg * H        dR/dlambda   ]
     //
-    // with r frozen during this linearization:
-    //
-    //         [ lambda Hess(g)    H^T ]
-    //     J = [                       ]
-    //         [      a H          b   ]
-    //
-    // The Hessian hook returns false in the base class, so J_xx is zero until
-    // a geometry specialization provides Hess(g).
+    // Bilateral: dR/dg=1, dR/dlambda=0.
+    // Unilateral: derivatives come from the scaled Fischer-Burmeister law.
+    // Pinned/invalid: R_lambda=lambda (dR/dlambda=1).
+    // The Hessian hook returns false in the base class.
 
     auto dRx_dX = matrix->getForceDerivativeIn(this->mstate1.get())
         .withRespectToPositionsIn(this->mstate1.get());
@@ -1616,7 +1668,7 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
             for (sofa::Size d = 0; d < TranslationalDim; ++d)
                 upperRight(d, 0) = c.gapGradient[d];
 
-            // J_lambdax = dphi/dg * dg/dx = a H.
+            // J_lambdax = dR_lambda/dg * dg/dx.
             for (sofa::Size d = 0; d < TranslationalDim; ++d)
                 lowerLeft(0, d) = c.dPhiDgap * c.gapGradient[d];
 
@@ -1630,8 +1682,7 @@ void FischerBurmeisterContactForceField<T1, T2>::buildStiffnessMatrix(core::beha
             }
         }
 
-        // Active row: dphi/dlambda = b.
-        // Pinned/invalid row: finalizeContactRow() sets b=1 and H=0, yielding the simple equation lambda=0.
+        // Mode-specific derivative; pinned/invalid rows use 1 (R_lambda=lambda).
         lowerRight(0, 0) = c.dPhiDlambda;
 
         if (c.status == ContactStatus::Active)

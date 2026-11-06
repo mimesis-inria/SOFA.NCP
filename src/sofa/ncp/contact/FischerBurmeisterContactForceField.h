@@ -23,6 +23,7 @@
 #pragma once
 
 #include <sofa/ncp/config.h>
+#include <sofa/ncp/contact/ContactLaw.h>
 
 #include <sofa/component/constraint/projective/FixedProjectiveConstraint.h>
 #include <sofa/component/solidmechanics/fem/elastic/BeamFEMForceField.h>
@@ -125,6 +126,7 @@ public:
 
     Data<Real> d_fixedComplianceScale;
     Data<unsigned int> d_complianceMode;
+    Data<unsigned int> d_constraintMode;
     Data<Real> d_fbEpsilon;
     Data<Real> d_contactNewtonRegularization;
 
@@ -246,7 +248,7 @@ protected:
     bool initializeContactRows();
     bool rebuildCurrentContacts(const VecCoord1&, const VecCoord2&);
     void finalizeContactRow(Contact&, ContactStatus, Real fixedComplianceScale) const;
-    void updateFischerBurmeisterTerms(Contact&) const;
+    void updateConstraintTerms(Contact&) const;
 
     Real complianceForPoint(sofa::Index pointIndex, Real fallback) const;
 

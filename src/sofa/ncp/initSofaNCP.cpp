@@ -7,11 +7,11 @@ using sofa::core::ObjectFactory;
 
 namespace sofa::ncp
 {
-    extern void registerNCPStaticSolver(sofa::core::ObjectFactory* factory);
-    extern void registerNCPDebugNewtonRaphsonSolver(sofa::core::ObjectFactory* factory);
-    extern void registerNCPMechanicalContinuationNewtonRaphsonSolver(sofa::core::ObjectFactory* factory);
+//     extern void registerNCPStaticSolver(sofa::core::ObjectFactory* factory);
+//     extern void registerNCPDebugNewtonRaphsonSolver(sofa::core::ObjectFactory* factory);
+//     extern void registerNCPMechanicalContinuationNewtonRaphsonSolver(sofa::core::ObjectFactory* factory);
 
-    extern void registerStaticComplianceProvider(sofa::core::ObjectFactory* factory);
+//     extern void registerStaticComplianceProvider(sofa::core::ObjectFactory* factory);
 
     extern void registerPlaneNCPContactForceField(sofa::core::ObjectFactory* factory);
     extern void registerCylinderNCPContactForceField(sofa::core::ObjectFactory* factory);
@@ -66,11 +66,11 @@ namespace sofa::ncp
 
     void registerObjects(sofa::core::ObjectFactory* factory)
     {
-        registerNCPStaticSolver(factory);
-        registerNCPDebugNewtonRaphsonSolver(factory);
-        registerNCPMechanicalContinuationNewtonRaphsonSolver(factory);
+        // registerNCPStaticSolver(factory);
+        // registerNCPDebugNewtonRaphsonSolver(factory);
+        // registerNCPMechanicalContinuationNewtonRaphsonSolver(factory);
 
-        registerStaticComplianceProvider(factory);
+        // registerStaticComplianceProvider(factory);
         
         registerPlaneNCPContactForceField(factory);
         registerCylinderNCPContactForceField(factory);

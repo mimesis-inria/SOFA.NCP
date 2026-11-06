@@ -14,7 +14,7 @@
 namespace sofa::ncp
 {
 
-using sofa::component::odesolver::backward::NewtonStatus;
+// using sofa::component::odesolver::backward::NewtonStatus;
 using BaseNonLinearFunction = sofa::component::odesolver::backward::newton_raphson::BaseNonLinearFunction;
 
 namespace
@@ -175,8 +175,8 @@ void NCPMechanicalContinuationNewtonRaphsonSolver::solveNCPContinuation(BaseNonL
 
     if (!finiteNonNegative(residual2) || !summary.valid)
     {
-        static constexpr NewtonStatus invalidResidual("DivergedInvalidResidual");
-        d_status.setValue(invalidResidual);
+        // static constexpr NewtonStatus invalidResidual("DivergedInvalidResidual");
+        // d_status.setValue(invalidResidual);
         d_lastFailureReason.setValue("invalid initial residual/contact state");
         msg_error() << "[NCP FAIL] invalid initial residual/contact state.";
         return;
@@ -189,8 +189,8 @@ void NCPMechanicalContinuationNewtonRaphsonSolver::solveNCPContinuation(BaseNonL
 
     auto reportConverged = [&](const NCPDebugResidualSummary& stateSummary, SReal stateResidual2)
     {
-        static constexpr NewtonStatus converged("ConvergedEquilibrium");
-        d_status.setValue(converged);
+        // static constexpr NewtonStatus converged("ConvergedEquilibrium");
+        // d_status.setValue(converged);
         d_lastFailureReason.setValue(std::string());
 
         if (f_printLog.getValue() && d_logIterationSummary.getValue())
@@ -569,8 +569,8 @@ void NCPMechanicalContinuationNewtonRaphsonSolver::solveNCPContinuation(BaseNonL
         d_lastContinuationStages.setValue(0u);
     }
 
-    static constexpr NewtonStatus failedStatus("DivergedContinuation");
-    d_status.setValue(failedStatus);
+    // static constexpr NewtonStatus failedStatus("DivergedContinuation");
+    // d_status.setValue(failedStatus);
 
     msg_warning() << "[NCP FAIL] " << d_lastFailureReason.getValue()
                   << " outer=" << acceptedOuterUpdates

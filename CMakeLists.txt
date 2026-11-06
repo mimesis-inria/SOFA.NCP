@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(SofaNCP VERSION 0.1.0 LANGUAGES CXX)
+project(SofaNCP VERSION 0.1.2 LANGUAGES CXX)
 
 if(NOT TARGET Sofa.Framework)
     find_package(Sofa.Framework REQUIRED)
@@ -19,9 +19,9 @@ set(HEADER_FILES
     ${SOFANCP_SRC_DIR}/config.h.in
     ${SOFANCP_SRC_DIR}/initSofaNCP.h
 
-    ${SOFANCP_SRC_DIR}/solvers/NCPStaticSolver.h
-    ${SOFANCP_SRC_DIR}/solvers/NCPDebugNewtonRaphsonSolver.h
-    ${SOFANCP_SRC_DIR}/solvers/NCPMechanicalContinuationNewtonRaphsonSolver.h
+    # ${SOFANCP_SRC_DIR}/solvers/NCPStaticSolver.h
+    # ${SOFANCP_SRC_DIR}/solvers/NCPDebugNewtonRaphsonSolver.h
+    # ${SOFANCP_SRC_DIR}/solvers/NCPMechanicalContinuationNewtonRaphsonSolver.h
 
     ${SOFANCP_SRC_DIR}/contact/FischerBurmeisterContactForceField.h
     ${SOFANCP_SRC_DIR}/contact/FischerBurmeisterContactForceField.inl
@@ -34,8 +34,8 @@ set(HEADER_FILES
     # ${SOFANCP_SRC_DIR}/contact/MeshNCPContactForceField.h
     # ${SOFANCP_SRC_DIR}/contact/MeshNCPContactForceField.inl
 
-    ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.h
-    ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.inl
+    # ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.h
+    # ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.inl
 )
 set(HEADER_FILES_TO_MOC
 )
@@ -43,16 +43,16 @@ set(HEADER_FILES_TO_MOC
 set(SOURCE_FILES
     ${SOFANCP_SRC_DIR}/initSofaNCP.cpp
 
-    ${SOFANCP_SRC_DIR}/solvers/NCPStaticSolver.cpp
-    ${SOFANCP_SRC_DIR}/solvers/NCPDebugNewtonRaphsonSolver.cpp
-    ${SOFANCP_SRC_DIR}/solvers/NCPMechanicalContinuationNewtonRaphsonSolver.cpp
+    # ${SOFANCP_SRC_DIR}/solvers/NCPStaticSolver.cpp
+    # ${SOFANCP_SRC_DIR}/solvers/NCPDebugNewtonRaphsonSolver.cpp
+    # ${SOFANCP_SRC_DIR}/solvers/NCPMechanicalContinuationNewtonRaphsonSolver.cpp
 
     ${SOFANCP_SRC_DIR}/contact/PlaneNCPContactForceField.cpp
     ${SOFANCP_SRC_DIR}/contact/CylinderNCPContactForceField.cpp
     ${SOFANCP_SRC_DIR}/contact/SignedDistanceFieldNCPContactForceField.cpp
     # ${SOFANCP_SRC_DIR}/contact/MeshNCPContactForceField.cpp
     
-    ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.cpp
+    # ${SOFANCP_SRC_DIR}/preconditioners/StaticComplianceProvider.cpp
 )
 
 add_library(${PROJECT_NAME} SHARED ${HEADER_FILES_TO_MOC} ${MOCCED_HEADER_FILES} ${HEADER_FILES} ${SOURCE_FILES} ${README_FILES})
